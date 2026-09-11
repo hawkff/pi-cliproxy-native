@@ -1,0 +1,39 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# Local configuration, credentials, and runtime data
+.env
+.env.*
+!.env.example
+*.local.*
+*.log
+.cache/
+.pi/
+.pi-subagents/
+.agents/
+.claude/
+.codex/
+/auth.json
+/config.json
+/models.json
+
+# Local instructions and review notes
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+/review-notes/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+Thumbs.db

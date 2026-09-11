@@ -68,7 +68,7 @@ Pi owns catalog persistence and cancellation. Cached entries are scoped to the c
 
 Discovery determines availability; Pi's built-in catalogs supply context limits, pricing, input types, and thinking capabilities. Exact IDs are matched against Anthropic, OpenAI, Codex, and Google metadata. Recognized catalog ownership resolves duplicate IDs; ambiguous cross-family matches are skipped.
 
-Unknown IDs are skipped with a warning rather than assigned guessed capabilities. To describe a proxy alias, add its canonical reference to `pi-cliproxyapi.json`:
+The extension skips unknown IDs without guessing capabilities or writing to the console. To describe a proxy alias, add its canonical reference to `pi-cliproxyapi.json`:
 
 ```json
 {

@@ -153,13 +153,7 @@ export function createCliproxyProvider(config: Config, known: readonly Model<Api
       if (context.credential?.type !== "api_key" || !context.credential.key) {
         throw new Error("Use /login cliproxyapi or set CLIPROXYAPI_API_KEY before refreshing.");
       }
-      const result = await discover(config, context.credential.key, context.signal, known);
-      if (result.skipped.length) {
-        console.warn(
-          `[pi-cliproxyapi] ${result.skipped.length} unknown models need aliases: ${result.skipped.slice(0, 10).join(", ")}`,
-        );
-      }
-      return result.models;
+      return (await discover(config, context.credential.key, context.signal, known)).models;
     },
     api: {
       "anthropic-messages": route(anthropicMessagesApi(), config.baseUrl),

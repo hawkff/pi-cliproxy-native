@@ -487,7 +487,7 @@ test("native adapters stream each family through the right endpoint with the pro
   }
 });
 
-test("Pi loads the package, refreshes through its command, and lists the catalog offline", async (t) => {
+test("Pi loads the package, refreshes quietly, and lists the catalog offline", async (t) => {
   const fixture = builtinCatalog()[0];
   assert.ok(fixture);
   let requests = 0;
@@ -496,7 +496,14 @@ test("Pi loads the package, refreshes through its command, and lists the catalog
     assert.equal(req.method, "GET");
     assert.equal(req.url, "/v1/models");
     assert.equal(req.headers.authorization, `Bearer ${key}`);
-    res.end(JSON.stringify({ data: [{ id: fixture.id, owned_by: fixture.provider }] }));
+    res.end(
+      JSON.stringify({
+        data: [
+          { id: fixture.id, owned_by: fixture.provider },
+          { id: "unknown-fixture", owned_by: "unmapped" },
+        ],
+      }),
+    );
   });
   const home = await mkdtemp(join(tmpdir(), "pi-cliproxyapi-test-"));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -586,6 +593,7 @@ test("Pi loads the package, refreshes through its command, and lists the catalog
     await closed;
   }
   assert.ok(notified, diagnostics);
+  assert.ok(!diagnostics.includes("[pi-cliproxyapi]"), diagnostics);
   assert.ok(requests > 0);
   await rm(join(home, "models.json"));
   const afterRefresh = requests;

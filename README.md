@@ -46,21 +46,19 @@ Root URLs and URLs ending in `/v1` or `/v1beta` are accepted. Path prefixes are 
 
 The environment variable takes precedence over the file. Configuration is global; project-local files cannot change the destination of your proxy key. Run `/reload` after changing the connection or aliases.
 
-For non-interactive use, supply the client key through `CLIPROXYAPI_API_KEY`. Stored `/login` credentials take precedence over that variable. The extension stores no credentials itself; Pi manages them in its auth store. `/logout` removes the stored key but does not unset environment variables.
+For non-interactive use, supply the client key through `CLIPROXYAPI_API_KEY`. First populate the catalog with `/cliproxyapi-refresh` in an interactive Pi session. Pi's `--list-models` and print modes read saved catalogs without startup network discovery.
+
+Stored `/login` credentials take precedence over the environment variable. The extension stores no credentials itself; Pi manages them in its auth store. `/logout` removes the stored key but does not unset environment variables.
 
 ## Refresh
 
-Pi restores the last successful catalog before network access and refreshes it through its native provider lifecycle. Force a refresh inside Pi:
+Pi restores the last successful catalog before network access. Interactive startup refreshes it in the background through Pi's native provider lifecycle. Force a refresh inside Pi:
 
 ```text
 /cliproxyapi-refresh
 ```
 
-Or from the terminal:
-
-```sh
-pi update --models
-```
+In Pi 0.85.1, `pi update --models` does not load package extensions and cannot refresh this provider. Use `/cliproxyapi-refresh` instead.
 
 Discovery calls `/v1/models` with a ten-second deadline. Failed requests and malformed responses leave the previous catalog intact. A successful empty catalog removes the discovered entries. Offline mode uses the saved catalog without contacting the proxy.
 

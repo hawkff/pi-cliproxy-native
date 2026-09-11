@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -344,7 +344,10 @@ test("non-strict Responses tools retain optional arguments and explicit strictne
 
 function sse(res: ServerResponse, events: unknown[]) {
   res.writeHead(200, { "content-type": "text/event-stream" });
-  for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  for (const event of events) {
+    if (isRecord(event) && typeof event.type === "string") res.write(`event: ${event.type}\n`);
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  }
   res.end();
 }
 
@@ -466,12 +469,15 @@ test("native adapters stream each family through the right endpoint with the pro
         actualApi === "anthropic-messages"
           ? "/gateway/v1/messages"
           : actualApi === "google-generative-ai"
-            ? `/gateway/v1beta/models/${source.id}:streamGenerateContent?alt=sse`
+            ? `/gateway/v1beta/models/${source.id}:streamGenerateContent`
             : actualApi === "openai-completions"
               ? "/gateway/v1/chat/completions"
               : "/gateway/v1/responses";
-      assert.equal(seenPath, expected);
+      const requestUrl = new URL(seenPath, baseUrl);
+      assert.equal(requestUrl.pathname, expected);
+      if (actualApi === "google-generative-ai") assert.equal(requestUrl.searchParams.get("alt"), "sse");
       assert.ok(isRecord(seenBody));
+      if (actualApi !== "google-generative-ai") assert.equal(seenBody.model, source.id);
       if (actualApi === "openai-responses") {
         assert.ok(Array.isArray(seenBody.tools));
         assert.equal(seenBody.tools[0].strict, null);
@@ -481,44 +487,115 @@ test("native adapters stream each family through the right endpoint with the pro
   }
 });
 
-test("Pi loads the package and discovers models in an isolated CLI invocation", async (t) => {
+test("Pi loads the package, refreshes through its command, and lists the catalog offline", async (t) => {
   const fixture = builtinCatalog()[0];
   assert.ok(fixture);
+  let requests = 0;
   const baseUrl = await server(t, (req, res) => {
+    requests++;
+    assert.equal(req.method, "GET");
+    assert.equal(req.url, "/v1/models");
     assert.equal(req.headers.authorization, `Bearer ${key}`);
     res.end(JSON.stringify({ data: [{ id: fixture.id, owned_by: fixture.provider }] }));
   });
   const home = await mkdtemp(join(tmpdir(), "pi-cliproxyapi-test-"));
   t.after(() => rm(home, { recursive: true, force: true }));
+  await writeFile(join(home, "settings.json"), JSON.stringify({ packages: [resolve(".")] }));
   const cli = resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
-  const { stdout, stderr } = await promisify(execFile)(
-    process.execPath,
-    [
-      cli,
-      "--no-extensions",
-      "--no-skills",
-      "--no-context-files",
-      "--no-prompt-templates",
-      "-e",
-      resolve("extensions/index.ts"),
-      "--list-models",
-      PROVIDER_ID,
-    ],
-    {
-      cwd: home,
-      timeout: 30000,
-      env: {
-        PATH: process.env.PATH,
-        HOME: home,
-        PI_CODING_AGENT_DIR: home,
-        PI_SKIP_VERSION_CHECK: "1",
-        PI_TELEMETRY: "0",
-        CLIPROXYAPI_BASE_URL: baseUrl,
-        CLIPROXYAPI_API_KEY: key,
-      },
+  const options = {
+    cwd: home,
+    timeout: 30000,
+    env: {
+      PATH: process.env.PATH,
+      HOME: home,
+      PI_CODING_AGENT_DIR: home,
+      PI_SKIP_VERSION_CHECK: "1",
+      PI_TELEMETRY: "0",
+      CLIPROXYAPI_BASE_URL: baseUrl,
+      CLIPROXYAPI_API_KEY: key,
     },
+  };
+  const run = promisify(execFile);
+  const cold = await run(process.execPath, [cli, "--list-models", PROVIDER_ID], options);
+  assert.ok(!cold.stdout.includes(fixture.id));
+  assert.equal(requests, 0);
+  // Pi needs an available model to enter RPC, even for extension-only commands.
+  // This unrelated fixture never runs inference and does not seed the proxy catalog.
+  await writeFile(
+    join(home, "models.json"),
+    JSON.stringify({
+      providers: {
+        fixture: { baseUrl, api: "openai-completions", apiKey: key, models: [{ id: "bootstrap" }] },
+      },
+    }),
+  );
+  const rpc = spawn(
+    process.execPath,
+    [cli, "--mode", "rpc", "--no-session", "--model", "fixture/bootstrap"],
+    options,
+  );
+  const closed = once(rpc, "close");
+  const refreshed = Promise.withResolvers<void>();
+  let buffer = "";
+  let diagnostics = "";
+  let notified = false;
+  let accepted = false;
+  rpc.stderr.setEncoding("utf8");
+  rpc.stderr.on("data", (chunk) => {
+    diagnostics += chunk;
+  });
+  rpc.stdout.setEncoding("utf8");
+  rpc.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      try {
+        const event: unknown = JSON.parse(line);
+        if (isRecord(event)) {
+          if (
+            event.type === "extension_ui_request" &&
+            event.method === "notify" &&
+            event.message === "CLIProxyAPI: 1 models." &&
+            event.notifyType === "info"
+          )
+            notified = true;
+          if (event.type === "response" && event.id === "refresh") {
+            if (event.success === true) accepted = true;
+            else refreshed.reject(new Error("Refresh command failed."));
+          }
+          if (accepted && notified) refreshed.resolve();
+        }
+      } catch (error) {
+        refreshed.reject(error);
+      }
+      newline = buffer.indexOf("\n");
+    }
+  });
+  rpc.stdin.write(`${JSON.stringify({ id: "refresh", type: "prompt", message: "/cliproxyapi-refresh" })}\n`);
+  try {
+    await Promise.race([
+      refreshed.promise,
+      closed.then(() => {
+        throw new Error(`RPC exited before refresh completed: ${diagnostics}`);
+      }),
+    ]);
+  } finally {
+    rpc.kill();
+    await closed;
+  }
+  assert.ok(notified, diagnostics);
+  assert.ok(requests > 0);
+  await rm(join(home, "models.json"));
+  const afterRefresh = requests;
+  const { stdout, stderr } = await run(
+    process.execPath,
+    [cli, "--offline", "--list-models", PROVIDER_ID],
+    options,
   );
   assert.ok(stdout.includes(fixture.id), `${stdout}\n${stderr}`);
   assert.ok(stdout.includes(PROVIDER_ID));
   assert.ok(!stderr.includes("Failed to load extension"));
+  assert.equal(requests, afterRefresh);
 });

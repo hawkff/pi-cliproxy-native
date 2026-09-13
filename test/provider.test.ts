@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -10,6 +11,8 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   type Api,
+  type AssistantMessage,
+  type Context,
   createModels,
   getSupportedThinkingLevels,
   hasApi,
@@ -273,6 +276,28 @@ test("fresh Pi runtimes need provider registration to resolve cached models and 
   assert.equal(requests, 1);
 });
 
+test("old-policy chat catalogs cannot restore qualified retired media aliases", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("Offline restoration must not contact the proxy"));
+  const id = "vertex/imagen-4.0-generate-001";
+  const config = parseConfig({ aliases: { [id]: "google/gemini-fixture" } });
+  const provider = createCliproxyProvider(config, known);
+  await provider.refreshModels({
+    allowNetwork: false,
+    signal: AbortSignal.timeout(5000),
+    stored: {
+      etag: createHash("sha256")
+        .update(JSON.stringify([1, config]))
+        .digest("hex"),
+      models: [{ ...known[3], id, provider: PROVIDER_ID, headers: undefined }],
+    },
+    async publish(publication) {
+      publication.update?.();
+      return true;
+    },
+  });
+  assert.deepEqual(provider.getModels(), []);
+});
+
 test("cache cannot cross endpoints or alias configurations", async (t) => {
   const baseUrl = await server(t, (_req, res) => res.end(JSON.stringify(catalog)));
   const first = await collection(baseUrl);
@@ -402,13 +427,14 @@ function sse(res: ServerResponse, events: unknown[]) {
   res.end();
 }
 
-function respond(res: ServerResponse, api: string) {
+function respond(res: ServerResponse, api: string, model?: string) {
   if (api === "anthropic-messages") {
     sse(res, [
       {
         type: "message_start",
         message: {
           id: "fixture-message",
+          model,
           type: "message",
           role: "assistant",
           content: [],
@@ -465,9 +491,12 @@ function respond(res: ServerResponse, api: string) {
   }
 }
 
-test("native adapters stream each family through the right endpoint with the proxy key", async (t) => {
-  for (const source of known) {
-    await t.test(source.api, async (t) => {
+test("native adapters stream each family and qualified route through the right endpoint with the proxy key", async (t) => {
+  for (const source of known.flatMap((model) => [
+    model,
+    ...["vertex", "antigravity"].map((prefix) => ({ ...model, id: `${prefix}/${model.id}` })),
+  ])) {
+    await t.test(source.id, async (t) => {
       const actualApi = source.api === "openai-codex-responses" ? "openai-responses" : source.api;
       let seenPath = "";
       let seenBody: unknown;
@@ -475,7 +504,7 @@ test("native adapters stream each family through the right endpoint with the pro
         assert.equal(req.headers.authorization, `Bearer ${key}`);
         assert.equal(req.headers["x-upstream-only"], undefined);
         if (req.method === "GET") {
-          res.end(JSON.stringify(catalog));
+          res.end(JSON.stringify({ data: [{ id: source.id, owned_by: source.provider }] }));
           return;
         }
         seenPath = req.url ?? "";
@@ -486,7 +515,7 @@ test("native adapters stream each family through the right endpoint with the pro
         });
         req.on("end", () => {
           seenBody = JSON.parse(body);
-          respond(res, actualApi);
+          respond(res, actualApi, source.id.slice(source.id.indexOf("/") + 1));
         });
       });
       const { models } = await collection(`${baseUrl}/gateway`);
@@ -505,7 +534,12 @@ test("native adapters stream each family through the right endpoint with the pro
             },
           ],
         },
-        { maxTokens: 32, maxRetries: 0, signal: AbortSignal.timeout(10000) },
+        {
+          maxTokens: 32,
+          maxRetries: 0,
+          signal: AbortSignal.timeout(10000),
+          reasoning: actualApi === "anthropic-messages" ? "high" : undefined,
+        },
       );
       assert.equal(result.stopReason, "stop", result.errorMessage);
       assert.equal(
@@ -516,6 +550,7 @@ test("native adapters stream each family through the right endpoint with the pro
         "ok",
       );
       assert.equal(result.usage.output, 1);
+      if (source.id.includes("/")) assert.equal(result.model, source.id);
       const expected =
         actualApi === "anthropic-messages"
           ? "/gateway/v1/messages"
@@ -529,6 +564,11 @@ test("native adapters stream each family through the right endpoint with the pro
       if (actualApi === "google-generative-ai") assert.equal(requestUrl.searchParams.get("alt"), "sse");
       assert.ok(isRecord(seenBody));
       if (actualApi !== "google-generative-ai") assert.equal(seenBody.model, source.id);
+      if (actualApi === "anthropic-messages") {
+        assert.ok(isRecord(seenBody.thinking));
+        assert.equal(seenBody.thinking.type, "adaptive");
+        assert.deepEqual(seenBody.output_config, { effort: "high" });
+      }
       if (actualApi === "openai-responses") {
         assert.ok(Array.isArray(seenBody.tools));
         assert.equal(seenBody.tools[0].strict, null);
@@ -741,4 +781,189 @@ test("Pi loads the package, restores its catalog offline, and sends thinking suf
     }
   }
   assert.equal(requests, afterRefresh);
+});
+
+test("catalog preserves separate backend IDs, canonical aliases and exact alias precedence without owner routing guesses", () => {
+  const ids = known.flatMap(({ id }) => [id, `vertex/${id}`, `antigravity/${id}`]);
+  const config = parseConfig({
+    aliases: {
+      "team-chat": "anthropic/claude-fixture",
+      "vertex/team-chat": "google/gemini-fixture",
+      "custom/chat": "anthropic/claude-fixture",
+    },
+  });
+  const data = [
+    ...ids,
+    "vertex/team-chat",
+    "antigravity/team-chat",
+    "custom/chat",
+    "custom/gemini-fixture",
+    "vertex/custom/gemini-fixture",
+    "vertex/future",
+    "Vertex/gemini-fixture",
+  ];
+  const mapped = mapCatalog(
+    { data: [...data, ids[0]].map((id) => ({ id, owned_by: "google" })) },
+    config,
+    known,
+  );
+  assert.deepEqual(
+    mapped.models.map((model) => model.id),
+    data.slice(0, -4),
+  );
+  for (const model of mapped.models) {
+    assert.match(
+      model.name,
+      model.id.startsWith("vertex/")
+        ? / · Vertex$/
+        : model.id.startsWith("antigravity/")
+          ? / · Antigravity$/
+          : model.id.includes("/")
+            ? / · Unknown backend$/
+            : / · Automatic \(proxy routing\)$/,
+    );
+  }
+  assert.equal(mapped.models.find((model) => model.id === "vertex/team-chat")?.api, "google-generative-ai");
+  assert.equal(
+    mapped.models.find((model) => model.id === "antigravity/team-chat")?.api,
+    "anthropic-messages",
+  );
+  const ambiguous = [...known, { ...known[0], name: "Duplicate metadata" }];
+  assert.deepEqual(mapCatalog({ data: [{ id: "antigravity/team-chat" }] }, config, ambiguous).models, []);
+});
+
+test("qualified chat IDs restore in the native registry and resolve exact CLI thinking references", async (t) => {
+  const ids = [known[0].id, `vertex/${known[0].id}`, `antigravity/${known[0].id}`];
+  let gets = 0;
+  const baseUrl = await server(t, (_req, res) => {
+    gets++;
+    res.end(JSON.stringify({ data: ids.map((id) => ({ id })) }));
+  });
+  const first = await collection(baseUrl);
+  await first.models.refresh();
+  const runtime = await ModelRuntime.create({ modelsPath: null, modelsStore: first.store });
+  runtime.registerNativeProvider(createCliproxyProvider(parseConfig({ baseUrl }), known));
+  await runtime.refresh({ allowNetwork: false });
+  for (const id of ids) {
+    const resolved = resolveCliModel({ cliModel: `${PROVIDER_ID}/${id}:high`, modelRuntime: runtime });
+    assert.equal(resolved.error, undefined);
+    assert.equal(resolved.model?.id, id);
+    assert.equal(resolved.thinkingLevel, "high");
+  }
+  assert.equal(gets, 1);
+});
+
+test("qualified Gemini adapters retain thinking, tool IDs, strict sampling, image turns and route-isolated signatures", async (t) => {
+  const ids = [
+    "gemini-2.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+  ];
+  const sources = builtinCatalog().filter((model) => model.provider === "google" && ids.includes(model.id));
+  assert.equal(sources.length, ids.length);
+  const baseUrl = await server(t, (req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      assert.equal(JSON.parse(body).generationConfig.temperature, 0.25);
+      respond(res, "google-generative-ai");
+    });
+  });
+  const provider = createCliproxyProvider(parseConfig({ baseUrl }), sources);
+  for (const source of sources) {
+    const signature = "c2lnbmF0dXJl";
+    const history = (id: string): Context => ({
+      messages: [
+        { role: "user", content: "fixture", timestamp: 0 },
+        {
+          role: "assistant",
+          api: "google-generative-ai",
+          provider: PROVIDER_ID,
+          model: id,
+          content: [
+            { type: "thinking", thinking: "fixture thought", thinkingSignature: signature },
+            { type: "toolCall", id: "call_1", name: "fixture", arguments: {}, thoughtSignature: signature },
+          ],
+          stopReason: "toolUse",
+          timestamp: 0,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        } satisfies AssistantMessage,
+        {
+          role: "toolResult",
+          toolCallId: "call_1",
+          toolName: "fixture",
+          content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+          isError: false,
+          timestamp: 0,
+        },
+      ],
+      tools: [
+        {
+          name: "fixture",
+          description: "fixture",
+          parameters: Type.Object({}),
+          constrainedSampling: { type: "json_schema", strict: "prefer" },
+        },
+      ],
+    });
+    let baseline: unknown;
+    const run = async (id: string, context: Context, inspect: (payload: Record<string, unknown>) => void) => {
+      const model = mapCatalog({ data: [{ id }] }, parseConfig({ baseUrl }), sources).models[0];
+      assert.ok(model);
+      const before = structuredClone(context);
+      const stream = provider.streamSimple(model, context, {
+        apiKey: key,
+        headers: { Authorization: `Bearer ${key}` },
+        reasoning: "high",
+        maxRetries: 0,
+        signal: AbortSignal.timeout(5000),
+        onPayload(payload, hookModel) {
+          assert.equal(hookModel.id, id);
+          assert.ok(isRecord(payload));
+          assert.equal(payload.model, id);
+          inspect(payload);
+          return { ...payload, config: { ...(payload.config as object), temperature: 0.25 } };
+        },
+      });
+      for await (const event of stream) {
+        const message =
+          event.type === "done" ? event.message : event.type === "error" ? event.error : event.partial;
+        assert.equal(message.model, id);
+      }
+      const result = await stream.result();
+      assert.equal(result.stopReason, "stop", result.errorMessage);
+      assert.deepEqual(context, before);
+    };
+    await run(source.id, history(source.id), ({ model: _model, ...payload }) => {
+      baseline = JSON.parse(JSON.stringify(payload));
+    });
+    for (const prefix of ["vertex", "antigravity"]) {
+      const id = `${prefix}/${source.id}`;
+      await run(id, history(id), ({ model: _model, ...payload }) => {
+        assert.deepEqual(JSON.parse(JSON.stringify(payload)), baseline);
+        assert.ok(JSON.stringify(payload).includes(signature));
+        if (source.id.startsWith("gemini-3")) {
+          assert.match(JSON.stringify(payload), /"id":"call_1"/);
+          assert.match(JSON.stringify(payload), /VALIDATED/);
+        }
+        if (source.id.startsWith("gemini-2")) assert.match(JSON.stringify(payload), /Tool result image:/);
+      });
+      for (const previous of [source.id, `${prefix === "vertex" ? "antigravity" : "vertex"}/${source.id}`]) {
+        await run(id, history(previous), (payload) =>
+          assert.ok(!JSON.stringify(payload).includes(signature)),
+        );
+      }
+    }
+  }
 });

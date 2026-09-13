@@ -18,7 +18,7 @@ const generationParameters = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact canonical ID from cliproxyapi_media_models. Omit only after selecting a session default with /cli:model; explicit ID wins.",
+        "Exact advertised ID, including any routing prefix, from cliproxyapi_media_models. Omit only after selecting a session default with /cli:model; explicit ID wins.",
     }),
   ),
   prompt: Type.String({ minLength: 1 }),

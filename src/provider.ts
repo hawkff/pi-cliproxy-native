@@ -3,6 +3,7 @@ import {
   type Api,
   createProvider,
   envApiKeyAuth,
+  lazyStream,
   type Model,
   type ProviderStreams,
   type RefreshModelsContext,
@@ -16,7 +17,7 @@ import {
   openAIResponsesApi,
 } from "@earendil-works/pi-ai/compat";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
-import { type CpaApi, endpoint, mapCatalog } from "./catalog.ts";
+import { type CpaApi, endpoint, mapCatalog, modelRoute } from "./catalog.ts";
 import { type Config, isRecord, PROVIDER_ID } from "./config.ts";
 
 export function builtinCatalog() {
@@ -102,33 +103,68 @@ export function nonStrictTools(payload: unknown) {
 }
 
 function route(streams: ProviderStreams, baseUrl: string): ProviderStreams {
-  const atEndpoint = (model: Model<Api>) => ({ ...model, baseUrl: endpoint(baseUrl, model.api) });
-  const payloadHook =
-    (next?: SimpleStreamOptions["onPayload"]) => async (payload: unknown, model: Model<Api>) => {
-      // Responses defaults omitted strictness to strict; preserve optional tool arguments.
-      const adapted = model.api === "openai-responses" ? nonStrictTools(payload) : payload;
-      const result = await next?.(adapted, model);
-      return result === undefined ? adapted : result;
+  const wrap =
+    (stream: ProviderStreams["streamSimple"]): ProviderStreams["streamSimple"] =>
+    (selected, context, options) => {
+      // A resumed selection must not send the current key to an old endpoint.
+      const model = { ...selected, baseUrl: endpoint(baseUrl, selected.api) };
+      const { metadataId, backend } = modelRoute(model.id);
+      const google = backend && model.api === "google-generative-ai";
+      const adapterModel = google ? { ...model, id: metadataId } : model;
+      // Google needs canonical IDs for tool turns. Swap identities to keep bare history cross-route.
+      const adapterContext = google
+        ? {
+            ...context,
+            messages: context.messages.map((message) =>
+              message.role === "assistant" && message.provider === model.provider
+                ? {
+                    ...message,
+                    model:
+                      message.model === model.id
+                        ? metadataId
+                        : message.model === metadataId
+                          ? model.id
+                          : message.model,
+                  }
+                : message,
+            ),
+          }
+        : context;
+      const onPayload: SimpleStreamOptions["onPayload"] = async (payload) => {
+        // Responses defaults omitted strictness to strict; preserve optional tool arguments.
+        const adapted =
+          google && isRecord(payload)
+            ? { ...payload, model: model.id }
+            : model.api === "openai-responses"
+              ? nonStrictTools(payload)
+              : payload;
+        const result = await options?.onPayload?.(adapted, model);
+        return result === undefined ? adapted : result;
+      };
+      const run = () =>
+        stream(adapterModel, adapterContext, {
+          ...options,
+          onPayload,
+          onResponse: options?.onResponse ? (response) => options.onResponse?.(response, model) : undefined,
+        });
+      if (!backend) return run();
+      return lazyStream(model, async () => ({
+        async *[Symbol.asyncIterator]() {
+          for await (const event of run()) {
+            if (event.type === "done") yield { ...event, message: { ...event.message, model: model.id } };
+            else if (event.type === "error") yield { ...event, error: { ...event.error, model: model.id } };
+            else yield { ...event, partial: { ...event.partial, model: model.id } };
+          }
+        },
+      }));
     };
-  return {
-    // A resumed selection must not send the current key to an old endpoint.
-    stream: (model, context, options) =>
-      streams.stream(atEndpoint(model), context, {
-        ...options,
-        onPayload: payloadHook(options?.onPayload),
-      }),
-    streamSimple: (model, context, options) =>
-      streams.streamSimple(atEndpoint(model), context, {
-        ...options,
-        onPayload: payloadHook(options?.onPayload),
-      }),
-  };
+  return { stream: wrap(streams.stream), streamSimple: wrap(streams.streamSimple) };
 }
 
 export function createCliproxyProvider(config: Config, known: readonly Model<Api>[] = builtinCatalog()) {
   const standardAuth = envApiKeyAuth("CLIProxyAPI API key", ["CLIPROXYAPI_API_KEY"]);
   const scope = createHash("sha256")
-    .update(JSON.stringify([1, config]))
+    .update(JSON.stringify([2, config]))
     .digest("hex");
   const provider = createProvider<CpaApi>({
     id: PROVIDER_ID,

@@ -8,23 +8,23 @@ import {
   type RefreshModelsContext,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
-import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
-import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
-import { googleProvider } from "@earendil-works/pi-ai/providers/google";
-import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+// Pi's SDK loader aliases these entry points; deep pi-ai imports resolve to invalid paths.
+import {
+  anthropicMessagesApi,
+  googleGenerativeAIApi,
+  openAICompletionsApi,
+  openAIResponsesApi,
+} from "@earendil-works/pi-ai/compat";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { type CpaApi, endpoint, mapCatalog } from "./catalog.ts";
 import { type Config, isRecord, PROVIDER_ID } from "./config.ts";
 
 export function builtinCatalog() {
   return [
-    ...anthropicProvider().getModels(),
-    ...openaiProvider().getModels(),
-    ...openaiCodexProvider().getModels(),
-    ...googleProvider().getModels(),
+    ...getBuiltinModels("anthropic"),
+    ...getBuiltinModels("openai"),
+    ...getBuiltinModels("openai-codex"),
+    ...getBuiltinModels("google"),
   ];
 }
 

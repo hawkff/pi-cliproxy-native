@@ -86,6 +86,32 @@ Use Pi's `models.json` `modelOverrides` for per-model limits, pricing, or compat
 
 Catalog prices are estimates, not the proxy's bill. Verify limits against the upstream account before increasing them.
 
+## Thinking and subagents
+
+Use `cliproxyapi/<model-id>:high` as the model reference in Pi or pi-subagents. Pi separates the thinking suffix from the model ID; the proxy receives the original ID and native thinking parameters. Keep thinking suffixes out of metadata alias mappings.
+
+Supported levels come from the model's metadata. `xhigh` and `max` require explicit support, and Pi clamps unsupported levels. A model that requires thinking cannot use `off`.
+
+pi-subagents gives children a separate model registry. Foreground children skip ambient extensions; background children can also exclude them through an extension allowlist. A saved catalog alone does not register this provider.
+
+Add the installed extension path to `subagentOnlyExtensions` for each native role that needs it. Merge this example into `~/.pi/agent/settings.json`, replacing the path and role name:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": {
+      "reviewer": {
+        "subagentOnlyExtensions": ["/path/to/pi-cliproxyapi/extensions/index.ts"]
+      }
+    }
+  }
+}
+```
+
+Preserve existing list entries. This setting adds child loading without replacing background extension discovery; it does not bypass a policy that denies extensions. Run `/reload` after changing settings.
+
+If the base model ID still fails to resolve, check child extension loading, authentication, and the saved catalog. Run `/cliproxyapi-refresh` in the parent before starting new children. Changing the thinking suffix cannot restore a missing provider.
+
 ## Compatibility
 
 Claude requests retain native thinking metadata and use the legacy fine-grained tool-streaming header instead of eager tool fields. Provider-specific deferred tools and strict-tool capabilities are disabled by default where the proxy's support is unverified. Responses function tools include `strict: null` when Pi omits strictness, preserving optional arguments. Explicit payload hooks retain final control.

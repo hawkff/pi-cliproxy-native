@@ -6,16 +6,19 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { type TestContext, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   type Api,
   createModels,
+  getSupportedThinkingLevels,
   hasApi,
   InMemoryCredentialStore,
   InMemoryModelsStore,
   type Model,
   Type,
 } from "@earendil-works/pi-ai";
+import { ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import { mapCatalog, parseCatalog } from "../src/catalog.ts";
 import { isRecord, normalizeBaseUrl, PROVIDER_ID, parseConfig } from "../src/config.ts";
 import { builtinCatalog, createCliproxyProvider, discover, nonStrictTools } from "../src/provider.ts";
@@ -35,7 +38,7 @@ const known: Model<Api>[] = [
   baseUrl: "https://upstream.example/v1",
   headers: { "x-upstream-only": "must-not-forward" },
   reasoning: true,
-  thinkingLevelMap: { off: null, high: "high", xhigh: "max" },
+  thinkingLevelMap: { off: null, high: "high", xhigh: "max", max: "max" },
   input: ["text", "image"],
   contextWindow: 128000,
   maxTokens: 8192,
@@ -220,6 +223,54 @@ test("native refresh persists metadata, restores offline, keeps failures, and ac
   await second.models.refresh();
   assert.equal(second.provider.getModels().length, 0);
   assert.equal((await second.store.read(PROVIDER_ID))?.models.length, 0);
+});
+
+test("fresh Pi runtimes need provider registration to resolve cached models and thinking suffixes", async (t) => {
+  let requests = 0;
+  const baseUrl = await server(t, (_req, res) => {
+    requests++;
+    res.end(JSON.stringify(catalog));
+  });
+  const first = await collection(baseUrl);
+  await first.models.refresh();
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER_ID, async () => ({ type: "api_key", key }));
+  const runtime = await ModelRuntime.create({
+    modelsPath: null,
+    modelsStore: first.store,
+    credentials,
+  });
+  const reference = `${PROVIDER_ID}/${known[0].id}`;
+  for (const suffix of ["", ":high", ":max"]) {
+    assert.ok(resolveCliModel({ cliModel: `${reference}${suffix}`, modelRuntime: runtime }).error);
+  }
+  runtime.registerNativeProvider(createCliproxyProvider(parseConfig({ baseUrl }), known));
+  assert.equal((await runtime.refresh({ allowNetwork: false })).errors.size, 0);
+  assert.equal(runtime.getAvailableSnapshot().filter((model) => model.provider === PROVIDER_ID).length, 5);
+  for (const source of known) {
+    for (const level of [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+      const resolved = resolveCliModel({
+        cliModel: `${PROVIDER_ID}/${source.id}${level ? `:${level}` : ""}`,
+        modelRuntime: runtime,
+      });
+      assert.equal(resolved.error, undefined);
+      assert.equal(resolved.warning, undefined);
+      assert.equal(resolved.model?.provider, PROVIDER_ID);
+      assert.equal(resolved.model?.id, source.id);
+      assert.equal(resolved.thinkingLevel, level);
+      assert.deepEqual(resolved.model?.thinkingLevelMap, source.thinkingLevelMap);
+      assert.ok(resolved.model);
+      assert.deepEqual(getSupportedThinkingLevels(resolved.model), [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+    }
+  }
+  assert.equal(requests, 1);
 });
 
 test("cache cannot cross endpoints or alias configurations", async (t) => {
@@ -487,11 +538,31 @@ test("native adapters stream each family through the right endpoint with the pro
   }
 });
 
-test("Pi loads the package, refreshes quietly, and lists the catalog offline", async (t) => {
-  const fixture = builtinCatalog()[0];
+test("Pi loads the package, restores its catalog offline, and sends thinking suffixes as effort", async (t) => {
+  const fixture = builtinCatalog().find(
+    (model) =>
+      hasApi(model, "anthropic-messages") &&
+      model.thinkingLevelMap?.max === "max" &&
+      model.thinkingLevelMap?.xhigh === "xhigh",
+  );
   assert.ok(fixture);
   let requests = 0;
+  let seenBody: unknown;
   const baseUrl = await server(t, (req, res) => {
+    if (req.method === "POST") {
+      assert.equal(new URL(req.url ?? "", "http://localhost").pathname, "/v1/messages");
+      assert.equal(req.headers.authorization, `Bearer ${key}`);
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+      req.on("end", () => {
+        seenBody = JSON.parse(body);
+        respond(res, "anthropic-messages");
+      });
+      return;
+    }
     requests++;
     assert.equal(req.method, "GET");
     assert.equal(req.url, "/v1/models");
@@ -605,5 +676,69 @@ test("Pi loads the package, refreshes quietly, and lists the catalog offline", a
   assert.ok(stdout.includes(fixture.id), `${stdout}\n${stderr}`);
   assert.ok(stdout.includes(PROVIDER_ID));
   assert.ok(!stderr.includes("Failed to load extension"));
+  assert.equal(requests, afterRefresh);
+  await run(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import assert from "node:assert/strict";
+    const { DefaultResourceLoader, ModelRuntime, resolveCliModel } = await import(${JSON.stringify(pathToFileURL(resolve("node_modules/@earendil-works/pi-coding-agent/dist/index.js")).href)});
+    const loader = new DefaultResourceLoader({
+      cwd: process.cwd(), agentDir: process.env.PI_CODING_AGENT_DIR,
+      noExtensions: true, noSkills: true, noContextFiles: true,
+      additionalExtensionPaths: [${JSON.stringify(resolve("extensions/index.ts"))}],
+    });
+    await loader.reload();
+    const { errors, runtime: registrations } = loader.getExtensions();
+    assert.deepEqual(errors, []);
+    assert.equal(registrations.pendingNativeProviderRegistrations.length, 1);
+    const runtime = await ModelRuntime.create();
+    for (const { provider } of registrations.pendingNativeProviderRegistrations) runtime.registerNativeProvider(provider);
+    assert.equal((await runtime.refresh({ allowNetwork: false })).errors.size, 0);
+    for (const suffix of ["", ":high", ":xhigh", ":max"]) {
+      const resolved = resolveCliModel({ cliModel: ${JSON.stringify(`${PROVIDER_ID}/${fixture.id}`)} + suffix, modelRuntime: runtime });
+      assert.equal(resolved.error, undefined);
+      assert.equal(resolved.warning, undefined);
+      assert.equal(resolved.model.id, ${JSON.stringify(fixture.id)});
+      assert.equal(resolved.thinkingLevel, suffix ? suffix.slice(1) : undefined);
+    }
+  `,
+    ],
+    options,
+  );
+  for (const level of [undefined, "high", "xhigh", "max"] as const) {
+    seenBody = undefined;
+    const pending = run(
+      process.execPath,
+      [
+        cli,
+        "--offline",
+        "--no-extensions",
+        "-e",
+        resolve("extensions/index.ts"),
+        "--no-session",
+        "--no-tools",
+        "--no-skills",
+        "--no-context-files",
+        "--model",
+        `${PROVIDER_ID}/${fixture.id}${level ? `:${level}` : ""}`,
+        "-p",
+        "Return ok.",
+      ],
+      options,
+    );
+    pending.child.stdin?.end();
+    await pending.then(({ stdout, stderr }) => assert.equal(stdout.trim(), "ok", stderr));
+    assert.ok(isRecord(seenBody));
+    assert.equal(seenBody.model, fixture.id);
+    if (level) {
+      assert.ok(isRecord(seenBody.thinking));
+      assert.equal(seenBody.thinking.type, "adaptive");
+      assert.ok(isRecord(seenBody.output_config));
+      assert.equal(seenBody.output_config.effort, level);
+    }
+  }
   assert.equal(requests, afterRefresh);
 });

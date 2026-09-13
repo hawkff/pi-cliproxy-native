@@ -34,18 +34,48 @@ export function parseCatalog(value: unknown) {
   });
 }
 
-// CLIProxyAPI v7.2.158 routes these IDs through its image and native video handlers.
-const mediaPurposes = new Map<string, "image" | "video">([
-  ["grok-imagine-image", "image"],
-  ["grok-imagine-image-quality", "image"],
-  ["grok-imagine-image-2.0", "image"],
-  ["grok-imagine-video", "video"],
-  ["grok-imagine-video-1.5", "video"],
-  ["grok-imagine-video-1.5-preview", "video"],
+export type MediaPurpose = "image" | "video";
+
+// Exact IDs supported by CLIProxyAPI v7.2.158; input vision alone does not imply image output.
+const mediaModels = new Map<
+  string,
+  { name: string; purpose: MediaPurpose; route: "xai" | "gemini" | "imagen" }
+>([
+  ["grok-imagine-image", { name: "Grok Imagine Image", purpose: "image", route: "xai" }],
+  ["grok-imagine-image-quality", { name: "Grok Imagine Image Quality", purpose: "image", route: "xai" }],
+  ["grok-imagine-image-2.0", { name: "Grok Imagine Image 2.0", purpose: "image", route: "xai" }],
+  ["grok-imagine-video", { name: "Grok Imagine Video", purpose: "video", route: "xai" }],
+  ["grok-imagine-video-1.5", { name: "Grok Imagine Video 1.5", purpose: "video", route: "xai" }],
+  [
+    "grok-imagine-video-1.5-preview",
+    { name: "Grok Imagine Video 1.5 Preview", purpose: "video", route: "xai" },
+  ],
+  [
+    "gemini-2.5-flash-image",
+    { name: "Nano Banana (Gemini 2.5 Flash Image)", purpose: "image", route: "gemini" },
+  ],
+  [
+    "gemini-3.1-flash-image",
+    { name: "Nano Banana 2 (Gemini 3.1 Flash Image)", purpose: "image", route: "gemini" },
+  ],
+  ["gemini-3-pro-image", { name: "Nano Banana Pro (Gemini 3 Pro Image)", purpose: "image", route: "gemini" }],
+  [
+    "gemini-3.1-flash-lite-image",
+    { name: "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)", purpose: "image", route: "gemini" },
+  ],
+  ["imagen-3.0-generate-002", { name: "Imagen 3", purpose: "image", route: "imagen" }],
+  ["imagen-3.0-fast-generate-001", { name: "Imagen 3 Fast", purpose: "image", route: "imagen" }],
+  ["imagen-4.0-generate-001", { name: "Imagen 4", purpose: "image", route: "imagen" }],
+  ["imagen-4.0-fast-generate-001", { name: "Imagen 4 Fast", purpose: "image", route: "imagen" }],
+  ["imagen-4.0-ultra-generate-001", { name: "Imagen 4 Ultra", purpose: "image", route: "imagen" }],
 ]);
 
+export function mediaCapability(id: string) {
+  return mediaModels.get(id);
+}
+
 export function mediaPurpose(id: string) {
-  return mediaPurposes.get(id);
+  return mediaCapability(id)?.purpose;
 }
 
 export function mapMediaCatalog(value: unknown) {

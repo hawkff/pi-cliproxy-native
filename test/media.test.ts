@@ -8,9 +8,11 @@ import { join, resolve } from "node:path";
 import { type TestContext, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { mapCatalog, mapMediaCatalog } from "../src/catalog.ts";
 import { PROVIDER_ID, parseConfig } from "../src/config.ts";
 import { generateImage, generateVideo, listMediaModels, videoStatus } from "../src/media.ts";
+import { MEDIA_DEFAULTS_ENTRY } from "../src/media-defaults.ts";
 import { builtinCatalog } from "../src/provider.ts";
 
 const key = "fixture-media-key";
@@ -490,4 +492,236 @@ test("Pi loads and executes all four media tools with registry auth without chat
     "POST /v1/videos",
     "GET /v1/videos/fixture",
   ]);
+});
+
+const googleIds = [
+  "gemini-2.5-flash-image",
+  "gemini-3.1-flash-image",
+  "gemini-3-pro-image",
+  "gemini-3.1-flash-lite-image",
+  "imagen-3.0-generate-002",
+  "imagen-3.0-fast-generate-001",
+  "imagen-4.0-generate-001",
+  "imagen-4.0-fast-generate-001",
+  "imagen-4.0-ultra-generate-001",
+];
+const googleCatalog = { data: googleIds.map((id) => ({ id, owned_by: "google" })) };
+const inline = (data = png, mimeType = "image/png") => ({ inlineData: { data, mimeType } });
+const googleResponse = (parts: unknown[] = [inline()]) => ({
+  candidates: [{ finishReason: "STOP", content: { parts } }],
+});
+
+test("Google exact IDs cannot become chat aliases and require live availability, including Nano Banana 2 Lite", () => {
+  const known = builtinCatalog();
+  const chat = known[0];
+  const config = parseConfig({
+    aliases: Object.fromEntries(googleIds.map((id) => [id, `${chat.provider}/${chat.id}`])),
+  });
+  assert.deepEqual(mapCatalog(googleCatalog, config, known).models, []);
+  assert.equal(mapMediaCatalog(googleCatalog).length, 9);
+  assert.deepEqual(
+    mapMediaCatalog({
+      data: [
+        { id: "google/gemini-2.5-flash-image" },
+        { id: "veo-3" },
+        { id: "gemini-3.1-flash-lite-image", visibility: "hide" },
+      ],
+    }),
+    [],
+  );
+});
+
+test("Google Gemini and all five Imagen models use proxy generateContent with minimal payloads and final image normalization", async (t) => {
+  let expected = "";
+  const requests: string[] = [];
+  const config = parseConfig({
+    baseUrl: `${await server(t, (req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      assert.equal(req.headers.authorization, `Bearer ${key}`);
+      assert.equal(req.headers["x-extra"], undefined);
+      if (req.method === "GET") return void res.end(JSON.stringify(googleCatalog));
+      assert.equal(req.url, `/gateway/v1beta/models/${expected}:generateContent`);
+      void body(req).then((value) => {
+        assert.deepEqual(value, {
+          contents: [{ role: "user", parts: [{ text: "fixture" }] }],
+          ...(expected.startsWith("imagen-")
+            ? { sampleCount: 1 }
+            : { generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 } }),
+        });
+        res.end(
+          JSON.stringify(
+            googleResponse([
+              { thought: true, ...inline("invalid-thought-data") },
+              { text: "Final image" },
+              inline(),
+            ]),
+          ),
+        );
+      });
+    })}/gateway/v1beta`,
+  });
+  const ctx = context(await home(t));
+  for (const id of googleIds) {
+    expected = id;
+    const result = await generateImage(config, { model: id, prompt: "fixture" }, ctx);
+    assert.equal(result.details.model, id);
+    assert.equal(result.details.files.length, 1);
+    assert.equal((await readFile(result.details.files[0].path)).toString("base64"), png);
+    assert.deepEqual(result.content[1], { type: "image", data: png, mimeType: "image/png" });
+  }
+  assert.equal(requests.length, googleIds.length * 2);
+});
+
+test("Google preserves every final image, recognizes MIME signatures, and shares the inline preview budget", async (t) => {
+  let parts = [inline(), inline(jpeg, "image/jpeg"), inline(webp, "image/webp")];
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) =>
+      res.end(JSON.stringify(req.method === "GET" ? googleCatalog : googleResponse(parts))),
+    ),
+  });
+  const ctx = context(await home(t));
+  const result = await generateImage(config, { model: googleIds[0], prompt: "fixture" }, ctx);
+  assert.equal(result.details.files.length, 3);
+  assert.equal(new Set(result.details.files.map((file) => file.path)).size, 3);
+  assert.deepEqual(
+    result.details.files.map((file) => file.mimeType),
+    ["image/png", "image/jpeg", "image/webp"],
+  );
+  const large = Buffer.concat([Buffer.from(png, "base64"), Buffer.alloc(2 * 1024 * 1024)]).toString("base64");
+  parts = [inline(large), inline(large)];
+  const limited = await generateImage(config, { model: googleIds[0], prompt: "fixture" }, ctx);
+  assert.equal(limited.details.files.length, 2);
+  assert.equal(limited.content.filter((part) => part.type === "image").length, 1);
+  assert.match(JSON.stringify(limited.content.filter((part) => part.type === "text")), /4 MiB inline budget/);
+});
+
+test("Google rejects safety/refusal, thought-only, text-only, nonfinal and malformed images atomically", async (t) => {
+  let response: unknown;
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) =>
+      res.end(JSON.stringify(req.method === "GET" ? googleCatalog : response)),
+    ),
+  });
+  const ctx = context(await home(t));
+  for (const value of [
+    null,
+    {},
+    { error: { message: key } },
+    { ...googleResponse(), promptFeedback: { blockReason: "SAFETY" } },
+    { ...googleResponse(), promptFeedback: { safetyRatings: [{ blocked: true }] } },
+    { ...googleResponse(), refusal: key },
+    ...["SAFETY", "IMAGE_SAFETY", "RECITATION", "MAX_TOKENS", "OTHER", undefined].map((finishReason) => ({
+      candidates: [{ finishReason, content: { parts: [inline()] } }],
+    })),
+    { candidates: [{ ...googleResponse().candidates[0], safetyRatings: [{ blocked: true }] }] },
+    { candidates: [{ ...googleResponse().candidates[0], refusal: key }] },
+    googleResponse([{ text: "Cannot generate that image." }]),
+    googleResponse([{ thought: true, ...inline() }]),
+    googleResponse([inline(), { refusal: key }]),
+    googleResponse([inline(), inline(png, "image/jpeg")]),
+    googleResponse([inline(), inline("!!!!")]),
+    googleResponse([inline(), { inlineData: { data: png } }]),
+    googleResponse([inline(), { fileData: { fileUri: "https://must-not-contact.example" } }]),
+    googleResponse([null]),
+    googleResponse([]),
+    googleResponse(Array(17).fill(inline())),
+    { candidates: [...googleResponse().candidates, ...googleResponse().candidates] },
+  ]) {
+    response = value;
+    await assert.rejects(
+      generateImage(config, { model: googleIds[0], prompt: "fixture" }, ctx),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /CLIProxyAPI/);
+        assert.ok(!error.message.includes(key));
+        return true;
+      },
+    );
+  }
+  assert.deepEqual(await readdir(ctx.cwd), []);
+});
+
+test("media defaults are per purpose, explicit IDs win, and hidden/stale defaults fail before POST", async (t) => {
+  let advertised = [...catalog.data, ...googleCatalog.data];
+  const posted: string[] = [];
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) => {
+      if (req.method === "GET") return void res.end(JSON.stringify({ data: advertised }));
+      posted.push(req.url ?? "");
+      if (req.url === "/v1/videos") res.end(JSON.stringify({ request_id: "fixture" }));
+      else
+        res.end(
+          JSON.stringify(
+            req.url === "/v1/images/generations" ? { data: [{ b64_json: png }] } : googleResponse(),
+          ),
+        );
+    }),
+  });
+  const ctx = { ...context(await home(t)), sessionManager: SessionManager.inMemory() };
+  await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /No image default.*\/cli:model/);
+  await assert.rejects(generateVideo(config, { prompt: "fixture" }, ctx), /No video default/);
+  ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+    version: 1,
+    endpoint: config.baseUrl,
+    defaults: { image: googleIds[0], video: videoModel },
+  });
+  assert.equal((await generateImage(config, { prompt: "fixture" }, ctx)).details.model, googleIds[0]);
+  assert.equal(
+    (await generateImage(config, { prompt: "fixture", model: imageModel }, ctx)).details.model,
+    imageModel,
+  );
+  assert.equal((await generateVideo(config, { prompt: "fixture" }, ctx)).model, videoModel);
+  for (const visibility of ["hide", "absent"]) {
+    advertised = visibility === "hide" ? [{ id: googleIds[0], owned_by: "google", ...{ visibility } }] : [];
+    await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /not available/);
+  }
+  assert.deepEqual(posted, [
+    `/v1beta/models/${googleIds[0]}:generateContent`,
+    "/v1/images/generations",
+    "/v1/videos",
+  ]);
+});
+
+test("Google HTTP errors, redirects, response caps and cancellation never retry or leak upstream bodies", async (t) => {
+  let mode = "http";
+  let posts = 0;
+  const arrived = Promise.withResolvers<void>();
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) => {
+      if (req.method === "GET") return void res.end(JSON.stringify(googleCatalog));
+      posts++;
+      if (mode === "http") res.writeHead(403).end(key);
+      else if (mode === "redirect")
+        res.writeHead(307, { location: "https://must-not-contact.example" }).end();
+      else if (mode === "oversized") res.end("x".repeat(32 * 1024 * 1024 + 1));
+      else if (mode === "cancel") {
+        res.writeHead(200);
+        res.write('{"candidates":[');
+        arrived.resolve();
+      } else res.end(key);
+    }),
+  });
+  const ctx = context(await home(t));
+  for (const next of ["http", "redirect", "oversized", "malformed"]) {
+    mode = next;
+    await assert.rejects(
+      generateImage(config, { model: googleIds[0], prompt: "fixture" }, ctx),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(!error.message.includes(key));
+        if (mode === "http") assert.match(error.message, /HTTP 403/);
+        return true;
+      },
+    );
+  }
+  mode = "cancel";
+  const controller = new AbortController();
+  const rejected = assert.rejects(
+    generateImage(config, { model: googleIds[0], prompt: "fixture" }, ctx, controller.signal),
+  );
+  await arrived.promise;
+  controller.abort();
+  await rejected;
+  assert.equal(posts, 5);
+  assert.deepEqual(await readdir(ctx.cwd), []);
 });

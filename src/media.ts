@@ -2,18 +2,25 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type ImageContent, type Static, type TextContent, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mapMediaCatalog, mediaPurpose } from "./catalog.ts";
+import { mapMediaCatalog, mediaCapability } from "./catalog.ts";
 import { type Config, isRecord, PROVIDER_ID } from "./config.ts";
+import { type DefaultsContext, readMediaDefaults, resolveMediaModel } from "./media-defaults.ts";
 import { fetchCatalog, validateKey } from "./provider.ts";
 
-type MediaContext = Pick<ExtensionContext, "cwd" | "model"> & {
-  modelRegistry: Pick<ExtensionContext["modelRegistry"], "getProviderAuth">;
-};
+type MediaContext = Pick<ExtensionContext, "cwd" | "model"> &
+  DefaultsContext & {
+    modelRegistry: Pick<ExtensionContext["modelRegistry"], "getProviderAuth">;
+  };
 
 const MAX_INLINE_IMAGE_BASE64_BYTES = 4 * 1024 * 1024;
 
 const generationParameters = Type.Object({
-  model: Type.String({ description: "Exact canonical ID from cliproxyapi_media_models; required." }),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Exact canonical ID from cliproxyapi_media_models. Omit only after selecting a session default with /cli:model; explicit ID wins.",
+    }),
+  ),
   prompt: Type.String({ minLength: 1 }),
 });
 
@@ -28,7 +35,7 @@ function deadline(signal: AbortSignal | undefined, milliseconds: number) {
   return AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(milliseconds)]);
 }
 
-async function mediaKey(ctx: MediaContext, signal: AbortSignal) {
+export async function mediaKey(ctx: Pick<MediaContext, "modelRegistry">, signal: AbortSignal) {
   signal.throwIfAborted();
   const cancelled = Promise.withResolvers<never>();
   const onAbort = () => cancelled.reject(new Error("CLIProxyAPI media operation cancelled or timed out."));
@@ -61,7 +68,7 @@ async function mediaRequest(
 ) {
   let response: Response;
   try {
-    response = await fetch(`${config.baseUrl}/v1/${path}`, {
+    response = await fetch(`${config.baseUrl}/${path}`, {
       method: body ? "POST" : "GET",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : undefined,
@@ -111,14 +118,10 @@ export async function listMediaModels(config: Config, ctx: MediaContext, signal?
 
 async function generationKey(
   config: Config,
-  params: Static<typeof generationParameters>,
-  purpose: "image" | "video",
+  params: { model: string; prompt: string },
   ctx: MediaContext,
   signal: AbortSignal,
 ) {
-  if (mediaPurpose(params.model) !== purpose) {
-    throw new Error(`Choose an explicit supported ${purpose} model from cliproxyapi_media_models.`);
-  }
   if (typeof params.prompt !== "string" || !params.prompt.trim()) {
     throw new Error("CLIProxyAPI media requires a non-empty prompt.");
   }
@@ -177,42 +180,126 @@ function parseImage(value: unknown) {
   return { bytes, extension, image };
 }
 
+function parseGoogleImages(value: unknown) {
+  const invalid = () =>
+    new Error(
+      "CLIProxyAPI Google image response is blocked, refused, incomplete, text-only, or malformed. No images saved.",
+    );
+  if (
+    !isRecord(value) ||
+    value.error !== undefined ||
+    value.refusal !== undefined ||
+    (value.promptFeedback !== undefined &&
+      (!isRecord(value.promptFeedback) || value.promptFeedback.blockReason !== undefined)) ||
+    !Array.isArray(value.candidates) ||
+    value.candidates.length !== 1
+  )
+    throw invalid();
+  const candidate: unknown = value.candidates[0];
+  if (
+    !isRecord(candidate) ||
+    candidate.finishReason !== "STOP" ||
+    candidate.refusal !== undefined ||
+    !isRecord(candidate.content) ||
+    !Array.isArray(candidate.content.parts) ||
+    candidate.content.parts.length > 256
+  )
+    throw invalid();
+  for (const ratings of [
+    isRecord(value.promptFeedback) ? value.promptFeedback.safetyRatings : undefined,
+    candidate.safetyRatings,
+  ]) {
+    if (
+      ratings !== undefined &&
+      (!Array.isArray(ratings) ||
+        ratings.some(
+          (rating: unknown) =>
+            !isRecord(rating) || (rating.blocked !== undefined && rating.blocked !== false),
+        ))
+    )
+      throw invalid();
+  }
+  const images: ReturnType<typeof parseImage>[] = [];
+  for (const part of candidate.content.parts) {
+    if (
+      !isRecord(part) ||
+      part.refusal !== undefined ||
+      (part.thought !== undefined && typeof part.thought !== "boolean")
+    )
+      throw invalid();
+    if (part.thought === true) continue;
+    if (part.inlineData !== undefined) {
+      if (!isRecord(part.inlineData) || typeof part.inlineData.data !== "string") throw invalid();
+      const parsed = parseImage({ data: [{ b64_json: part.inlineData.data }] });
+      if (part.inlineData.mimeType !== parsed.image.mimeType) throw invalid();
+      images.push(parsed);
+    } else if (typeof part.text !== "string") throw invalid();
+  }
+  if (images.length === 0 || images.length > 16) throw invalid();
+  return images;
+}
+
 export async function generateImage(
   config: Config,
   params: Static<typeof generationParameters>,
   ctx: MediaContext,
   signal?: AbortSignal,
 ) {
+  const model = resolveMediaModel(config, ctx, "image", params.model);
   const bounded = deadline(signal, 180000);
-  const key = await generationKey(config, params, "image", ctx, bounded);
-  const result = await mediaRequest(config, key, "images/generations", bounded, 32 * 1024 * 1024, {
-    model: params.model,
-    prompt: params.prompt,
-    n: 1,
-    response_format: "b64_json",
-  });
-  const { bytes, extension, image } = parseImage(result);
+  const key = await generationKey(config, { ...params, model }, ctx, bounded);
+  const route = mediaCapability(model)?.route;
+  const result = await mediaRequest(
+    config,
+    key,
+    route === "xai" ? "v1/images/generations" : `v1beta/models/${model}:generateContent`,
+    bounded,
+    32 * 1024 * 1024,
+    route === "xai"
+      ? { model, prompt: params.prompt, n: 1, response_format: "b64_json" }
+      : {
+          contents: [{ role: "user", parts: [{ text: params.prompt }] }],
+          ...(route === "gemini"
+            ? { generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 } }
+            : { sampleCount: 1 }),
+        },
+  );
+  const images = route === "xai" ? [parseImage(result)] : parseGoogleImages(result);
   bounded.throwIfAborted();
   const artifacts = join(ctx.cwd, ".pi");
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
   const directory = await mkdtemp(join(artifacts, "cliproxyapi-image-"));
-  const path = join(directory, `image.${extension}`);
+  const files = images.map(({ extension, image }, index) => ({
+    path: join(directory, `${index === 0 ? "image" : `image-${index + 1}`}.${extension}`),
+    mimeType: image.mimeType,
+  }));
   try {
-    await writeFile(path, bytes, { flag: "wx", mode: 0o600, signal: bounded });
+    for (const [index, { bytes }] of images.entries()) {
+      await writeFile(files[index].path, bytes, { flag: "wx", mode: 0o600, signal: bounded });
+    }
+    bounded.throwIfAborted();
   } catch {
     await rm(directory, { recursive: true, force: true });
-    throw new Error("CLIProxyAPI generated an image but could not save the artifact.");
+    throw new Error("CLIProxyAPI generated images but could not save the artifacts.");
   }
-  const previewOmitted = !ctx.model?.input.includes("image")
-    ? "Preview omitted: the current chat model does not support images."
-    : image.data.length > MAX_INLINE_IMAGE_BASE64_BYTES
-      ? "Preview omitted: image base64 exceeds the 4 MiB inline budget. Use read on the saved file."
-      : undefined;
-  const content: (TextContent | ImageContent)[] = [
-    { type: "text", text: `Saved image: ${path}${previewOmitted ? `\n${previewOmitted}` : ""}` },
-  ];
-  if (!previewOmitted) content.push(image);
-  return { content, details: { model: params.model, files: [{ path, mimeType: image.mimeType }] } };
+  let previewBudget = MAX_INLINE_IMAGE_BASE64_BYTES;
+  const content: (TextContent | ImageContent)[] = [];
+  for (const [index, { image }] of images.entries()) {
+    const previewOmitted = !ctx.model?.input.includes("image")
+      ? "Preview omitted: the current chat model does not support images."
+      : image.data.length > previewBudget
+        ? "Preview omitted: image base64 exceeds the 4 MiB inline budget. Use read on the saved file."
+        : undefined;
+    content.push({
+      type: "text",
+      text: `Saved image: ${files[index].path}${previewOmitted ? `\n${previewOmitted}` : ""}`,
+    });
+    if (!previewOmitted) {
+      content.push(image);
+      previewBudget -= image.data.length;
+    }
+  }
+  return { content, details: { model, files } };
 }
 
 function requestId(value: unknown) {
@@ -236,22 +323,23 @@ export async function generateVideo(
   ) {
     throw new Error("CLIProxyAPI video duration must be an integer from 1 to 15 seconds.");
   }
+  const model = resolveMediaModel(config, ctx, "video", params.model);
   const bounded = deadline(signal, 60000);
-  const key = await generationKey(config, params, "video", ctx, bounded);
-  const result = await mediaRequest(config, key, "videos", bounded, 64 * 1024, {
-    model: params.model,
+  const key = await generationKey(config, { ...params, model }, ctx, bounded);
+  const result = await mediaRequest(config, key, "v1/videos", bounded, 64 * 1024, {
+    model,
     prompt: params.prompt,
     duration: params.duration,
   });
   if (!isRecord(result)) throw new Error("CLIProxyAPI returned an invalid video submission.");
-  return { model: params.model, request_id: requestId(result.request_id), status: "pending" };
+  return { model, request_id: requestId(result.request_id), status: "pending" };
 }
 
 export async function videoStatus(config: Config, id: string, ctx: MediaContext, signal?: AbortSignal) {
   const request_id = requestId(id);
   const bounded = deadline(signal, 15000);
   const key = await mediaKey(ctx, bounded);
-  const result = await mediaRequest(config, key, `videos/${request_id}`, bounded, 64 * 1024);
+  const result = await mediaRequest(config, key, `v1/videos/${request_id}`, bounded, 64 * 1024);
   if (!isRecord(result)) throw new Error("CLIProxyAPI returned an invalid video status.");
   if (result.status === "pending") return { request_id, status: "pending" };
   if (result.status === "failed" || result.status === "expired") {
@@ -289,14 +377,18 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const models = await listMediaModels(config, ctx, signal);
-      return { content: [{ type: "text", text: JSON.stringify({ models }) }], details: { models } };
+      const defaults = readMediaDefaults(config, ctx);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ models, defaults }) }],
+        details: { models, defaults },
+      };
     },
   });
   pi.registerTool({
     name: "cliproxyapi_generate_image",
     label: "CLIProxyAPI image",
     description:
-      "Generate one image using an explicit available image model. Saves a new artifact under .pi/ in the working directory and returns its path and an image preview for vision-capable chat models. Maximum response: 32 MiB; inline image base64: 4 MiB. Larger images return paths without previews. No automatic retries.",
+      "Generate images using an explicit available image model or the session image default selected with /cli:model. Saves each final image under a new .pi/ artifact directory and returns paths and previews for vision-capable chat models. Maximum response: 32 MiB; inline image base64: 4 MiB. Larger images return paths without previews. No automatic retries.",
     parameters: generationParameters,
     async execute(_id, params, signal, _update, ctx) {
       return generateImage(config, params, ctx, signal);
@@ -306,7 +398,7 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     name: "cliproxyapi_generate_video",
     label: "CLIProxyAPI video",
     description:
-      "Submit one video generation using an explicit available video model and optional duration (1–15 seconds). Returns request_id; use cliproxyapi_video_status to check it. Do not submit again to poll. No automatic retries.",
+      "Submit one video generation using an explicit available video model or the session video default selected with /cli:model and optional duration (1–15 seconds). Returns request_id; use cliproxyapi_video_status to check it. Do not submit again to poll. No automatic retries.",
     parameters: videoParameters,
     async execute(_id, params, signal, _update, ctx) {
       const details = await generateVideo(config, params, ctx, signal);

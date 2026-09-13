@@ -363,11 +363,24 @@ test("media cancellation bounds auth, discovery, submission and response-body wa
   const config = parseConfig({});
   const noAuth = { ...ctx, modelRegistry: { getProviderAuth: async () => undefined } };
   await assert.rejects(listMediaModels(config, noAuth), /authentication failed/);
-  const waitingAuth = { ...ctx, modelRegistry: { getProviderAuth: () => new Promise<never>(() => {}) } };
-  await assert.rejects(
-    listMediaModels(config, waitingAuth, AbortSignal.timeout(20)),
+  const authStarted = Promise.withResolvers<void>();
+  const authController = new AbortController();
+  const waitingAuth = {
+    ...ctx,
+    modelRegistry: {
+      getProviderAuth() {
+        authStarted.resolve();
+        return new Promise<never>(() => {});
+      },
+    },
+  };
+  const authCancelled = assert.rejects(
+    listMediaModels(config, waitingAuth, authController.signal),
     /cancelled or timed out/,
   );
+  await authStarted.promise;
+  authController.abort();
+  await authCancelled;
   await assert.rejects(listMediaModels(config, ctx, AbortSignal.abort()));
   for (const phase of ["catalog", "post", "body", "status"]) {
     const arrived = Promise.withResolvers<void>();

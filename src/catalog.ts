@@ -34,6 +34,29 @@ export function parseCatalog(value: unknown) {
   });
 }
 
+// CLIProxyAPI v7.2.158 routes these IDs through its image and native video handlers.
+const mediaPurposes = new Map<string, "image" | "video">([
+  ["grok-imagine-image", "image"],
+  ["grok-imagine-image-quality", "image"],
+  ["grok-imagine-image-2.0", "image"],
+  ["grok-imagine-video", "video"],
+  ["grok-imagine-video-1.5", "video"],
+  ["grok-imagine-video-1.5-preview", "video"],
+]);
+
+export function mediaPurpose(id: string) {
+  return mediaPurposes.get(id);
+}
+
+export function mapMediaCatalog(value: unknown) {
+  const models = new Map<string, { id: string; purpose: "image" | "video" }>();
+  for (const entry of parseCatalog(value)) {
+    const purpose = mediaPurpose(entry.id);
+    if (!entry.hidden && purpose) models.set(entry.id, { id: entry.id, purpose });
+  }
+  return [...models.values()];
+}
+
 const owners: Readonly<Record<string, string>> = {
   claude: "anthropic",
   anthropic: "anthropic",
@@ -50,6 +73,10 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
   const skipped = new Set<string>();
   for (const entry of parseCatalog(value)) {
     if (entry.hidden || models.has(entry.id)) continue;
+    if (mediaPurpose(entry.id)) {
+      skipped.add(entry.id);
+      continue;
+    }
     const alias = Object.hasOwn(config.aliases, entry.id) ? config.aliases[entry.id] : undefined;
     const candidates = known.filter((model) =>
       alias ? `${model.provider}/${model.id}` === alias : model.id === entry.id,

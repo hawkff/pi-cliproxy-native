@@ -8,7 +8,7 @@ import {
   type TuiMouseEvent,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import { mapCatalog, mediaCapability, parseCatalog } from "./catalog.ts";
+import { backendLabel, mapCatalog, mediaCapability, parseCatalog, routedName } from "./catalog.ts";
 import { type Config, PROVIDER_ID } from "./config.ts";
 import { mediaKey } from "./media.ts";
 import { MEDIA_DEFAULTS_ENTRY, type MediaDefaults, readMediaDefaults } from "./media-defaults.ts";
@@ -26,6 +26,7 @@ export function pickerCatalog(
       id: string;
       name: string;
       owner: string;
+      backend: string;
       purpose: string;
       model?: Model<Api>;
       supported: boolean;
@@ -38,8 +39,9 @@ export function pickerCatalog(
     const model = chat.get(entry.id);
     rows.set(entry.id, {
       id: entry.id,
-      name: media?.name ?? model?.name ?? entry.id,
+      name: model?.name ?? routedName(entry.id, media?.name),
       owner: entry.owner ?? "unknown owner",
+      backend: backendLabel(entry.id),
       purpose: media?.purpose ?? (model ? "chat" : "unknown / unsupported"),
       model,
       supported: !!(media || model) && !media?.disabledReason,
@@ -60,7 +62,8 @@ export function searchPickerItems(items: readonly PickerItem[], query: string) {
 }
 
 function defaultsLabel(defaults: MediaDefaults) {
-  return `Image: ${defaults.image ?? "none"} | Video: ${defaults.video ?? "none"}`;
+  const label = (id?: string) => (id ? routedName(id) : "none");
+  return `Image: ${label(defaults.image)} | Video: ${label(defaults.video)}`;
 }
 
 function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string) {
@@ -81,7 +84,10 @@ function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string
 }
 
 export class ModelPicker extends Container implements Focusable {
-  private input = new Input({ prompt: "Search: ", placeholder: "name, ID, owner, chat/image/video" });
+  private input = new Input({
+    prompt: "Search: ",
+    placeholder: "name, ID, backend, owner, chat/image/video",
+  });
   private items: PickerItem[];
   private selected = 0;
   private list: SelectList;

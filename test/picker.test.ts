@@ -37,10 +37,10 @@ const theme = { fg: (_color: string, text: string) => text } as ExtensionContext
 test("picker catalog labels verified purposes, friendly names and owners without guessing unknowns", () => {
   const rows = pickerCatalog(catalog, parseConfig({}));
   assert.equal(rows.length, 4);
-  assert.equal(rows[0].name, "Nano Banana 2 (Gemini 3.1 Flash Image)");
+  assert.equal(rows[0].name, "Nano Banana 2 · Automatic (proxy routing)");
   assert.equal(rows[0].owner, "antigravity");
   assert.equal(rows[0].purpose, "image");
-  assert.equal(rows[1].name, "Grok Imagine Video");
+  assert.equal(rows[1].name, "Grok Imagine Video · Automatic (proxy routing)");
   assert.equal(rows[2].purpose, "chat");
   assert.equal(rows[3].purpose, "unknown / unsupported");
   assert.equal(rows[3].supported, false);
@@ -66,11 +66,11 @@ test("retired Imagen rows remain visible with reasons but cannot be selected or 
     "imagen-4.0-generate-001",
     "imagen-4.0-fast-generate-001",
     "imagen-4.0-ultra-generate-001",
-  ];
+  ].flatMap((id) => [id, `vertex/${id}`, `antigravity/${id}`]);
   const advertised = { data: [...catalog.data, ...ids.map((id) => ({ id, owned_by: "google" }))] };
   const config = parseConfig({});
   const rows = pickerCatalog(advertised, config).filter((row) => ids.includes(row.id));
-  assert.equal(rows.length, 5);
+  assert.equal(rows.length, ids.length);
   for (const row of rows) {
     assert.match(row.name, /^Imagen [34]/);
     assert.equal(row.purpose, "image");
@@ -210,6 +210,35 @@ test("ModelPicker handles search, injected keys, paging, unsupported selection, 
   paging.handleInput("\r");
   assert.equal(selections.at(-1), "video-0");
   assert.ok(renders > 0);
+});
+
+test("Nano Banana backend labels remain visible in narrow picker rows", () => {
+  const rows = pickerCatalog(
+    { data: [{ id: "vertex/gemini-2.5-flash-image" }, { id: "antigravity/gemini-3.1-flash-image" }] },
+    parseConfig({}),
+  );
+  assert.deepEqual(
+    rows.map((row) => row.name),
+    ["Nano Banana · Vertex", "Nano Banana 2 · Antigravity"],
+  );
+  const picker = new ModelPicker(
+    rows.map((row) => ({
+      value: row.id,
+      label: `${row.name} (${row.id})`,
+      description: row.purpose,
+      supported: row.supported,
+    })),
+    "",
+    "",
+    theme,
+    new KeybindingsManager(TUI_KEYBINDINGS),
+    () => 14,
+    () => {},
+    () => {},
+  );
+  const lines = picker.render(40);
+  assert.ok(lines.some((line) => line.startsWith("→ Nano Banana · Vertex")));
+  assert.ok(lines.some((line) => line.startsWith("  Nano Banana 2 · Antigravity")));
 });
 
 test("ModelPicker ignores wheel and clicks so Enter always selects the keyboard-highlighted model", () => {
@@ -605,4 +634,129 @@ test("Pi loads and dispatches the colon command in RPC, print and JSON without i
   assert.ok(!cached.stdout.includes(image));
   assert.ok(!cached.stdout.includes(video));
   assert.equal(requests.length, 7);
+});
+
+test("picker labels backend routes across every purpose, selects exact effective chat IDs and restores qualified defaults", async (t) => {
+  const config = parseConfig({});
+  const ids = [chat.id, image, video, "future-model"].flatMap((id) => [
+    id,
+    `vertex/${id}`,
+    `antigravity/${id}`,
+  ]);
+  let advertised = [...ids, `custom/${image}`];
+  t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+    assert.equal(init?.method, undefined);
+    return new Response(JSON.stringify({ data: advertised.map((id) => ({ id, owned_by: "google" })) }));
+  });
+  const rows = pickerCatalog({ data: advertised.map((id) => ({ id, owned_by: "google" })) }, config);
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    advertised,
+  );
+  for (const row of rows) {
+    const backend = row.id.startsWith("vertex/")
+      ? "Vertex"
+      : row.id.startsWith("antigravity/")
+        ? "Antigravity"
+        : row.id.startsWith("custom/")
+          ? "Unknown backend"
+          : "Automatic (proxy routing)";
+    assert.equal(row.backend, backend);
+    assert.ok(row.name.endsWith(` · ${backend}`));
+    assert.equal(row.owner, "google");
+    if (row.id.endsWith(video) && row.id.includes("/")) {
+      assert.equal(row.purpose, "video");
+      assert.equal(row.supported, false);
+    }
+  }
+  const sessionManager = SessionManager.inMemory();
+  const notifications: string[] = [];
+  const statuses: string[] = [];
+  const selected: Model<Api>[] = [];
+  const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+  let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+  const registry = new Map(
+    rows.flatMap((row) => (row.model ? [[row.id, { ...row.model, contextWindow: 42 }] as const] : [])),
+  );
+  let refreshes = 0;
+  const pi = {
+    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) {
+      hooks.set(event, handler);
+    },
+    registerCommand(_name, options) {
+      command = options;
+    },
+    appendEntry(type, data) {
+      sessionManager.appendCustomEntry(type, data);
+    },
+    async setModel(model) {
+      selected.push(model);
+      return true;
+    },
+    sendMessage(message) {
+      notifications.push(String(message.content));
+    },
+  } as ExtensionAPI;
+  const ctx = {
+    mode: "rpc",
+    hasUI: true,
+    sessionManager,
+    ui: {
+      notify: (text: string) => notifications.push(text),
+      setStatus: (_key: string, text: string) => statuses.push(text),
+    },
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }),
+      find(provider: string, id: string) {
+        assert.equal(provider, "cliproxyapi");
+        return registry.get(id);
+      },
+      async refresh() {
+        refreshes++;
+        return { errors: new Map(), aborted: false };
+      },
+    },
+  } as unknown as ExtensionCommandContext;
+  t.mock.method(console, "error", (text: string) => notifications.push(text));
+  registerModelPicker(pi, config);
+  assert.ok(command);
+  for (const mode of ["rpc", "print", "json"] as const) {
+    await command.handler("list", { ...ctx, mode, hasUI: mode === "rpc" });
+    for (const label of [
+      "Vertex",
+      "Antigravity",
+      "Automatic (proxy routing)",
+      "Unknown backend",
+      "unknown / unsupported",
+    ])
+      assert.ok(notifications.at(-1)?.includes(label));
+    await command.handler("search antigravity banana", { ...ctx, mode, hasUI: mode === "rpc" });
+    assert.ok(notifications.at(-1)?.includes(`antigravity/${image}`));
+    assert.ok(!notifications.at(-1)?.includes(`vertex/${image}`));
+  }
+  for (const prefix of ["vertex", "antigravity"]) {
+    const id = `${prefix}/${chat.id}`;
+    await command.handler(`select ${id}`, ctx);
+    assert.equal(selected.at(-1), registry.get(id));
+  }
+  await command.handler(`select vertex/${image}`, ctx);
+  assert.equal(selected.length, 2);
+  const header = sessionManager.getHeader();
+  assert.ok(header);
+  const restored = SessionManager.inMemory(undefined, undefined, [header, ...sessionManager.getBranch()]);
+  assert.deepEqual(readMediaDefaults(config, { sessionManager: restored }), { image: `vertex/${image}` });
+  for (const hook of ["session_start", "session_tree"]) {
+    hooks.get(hook)?.({}, { ...ctx, sessionManager: restored });
+    assert.ok(statuses.at(-1)?.includes(`vertex/${image} · Vertex`));
+  }
+  registry.delete(`vertex/${chat.id}`);
+  await command.handler(`select vertex/${chat.id}`, ctx);
+  assert.equal(refreshes, 1);
+  assert.equal(selected.length, 2);
+  advertised = advertised.filter((id) => id !== `vertex/${chat.id}` && id !== `antigravity/${image}`);
+  await command.handler(`select vertex/${chat.id}`, ctx);
+  await command.handler(`select antigravity/${image}`, ctx);
+  assert.equal(selected.length, 2);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(readMediaDefaults(config, ctx), { image: `vertex/${image}` });
 });

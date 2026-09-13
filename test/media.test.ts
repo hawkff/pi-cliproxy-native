@@ -9,7 +9,7 @@ import { type TestContext, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { mapCatalog, mapMediaCatalog } from "../src/catalog.ts";
+import { mapCatalog, mapMediaCatalog, mediaCapability, routedName } from "../src/catalog.ts";
 import { PROVIDER_ID, parseConfig } from "../src/config.ts";
 import { generateImage, generateVideo, listMediaModels, videoStatus } from "../src/media.ts";
 import { MEDIA_DEFAULTS_ENTRY } from "../src/media-defaults.ts";
@@ -82,7 +82,11 @@ async function body(req: IncomingMessage) {
 test("media catalog maps six exact IDs, excludes hidden and unknown IDs, and cannot seed chat aliases", () => {
   assert.deepEqual(
     mapMediaCatalog(catalog),
-    ids.map((id, index) => ({ id, purpose: index < 3 ? "image" : "video" })),
+    ids.map((id, index) => ({
+      id,
+      purpose: index < 3 ? "image" : "video",
+      name: routedName(id, mediaCapability(id)?.name),
+    })),
   );
   assert.deepEqual(
     mapMediaCatalog({
@@ -95,7 +99,7 @@ test("media catalog maps six exact IDs, excludes hidden and unknown IDs, and can
         ...["xai", "x-ai", "grok", "team"].map((prefix) => ({ id: `${prefix}/${imageModel}` })),
       ],
     }),
-    [{ id: videoModel, purpose: "video" }],
+    [{ id: videoModel, purpose: "video", name: routedName(videoModel, mediaCapability(videoModel)?.name) }],
   );
   const known = builtinCatalog();
   const chat = known[0];
@@ -507,7 +511,16 @@ const retiredIds = [
   "imagen-4.0-fast-generate-001",
   "imagen-4.0-ultra-generate-001",
 ];
-const googleCatalog = { data: [...googleIds, ...retiredIds].map((id) => ({ id, owned_by: "google" })) };
+const qualifiedGoogleIds = googleIds.flatMap((id) => [id, `vertex/${id}`, `antigravity/${id}`]);
+const qualifiedRetiredIds = retiredIds.flatMap((id) => [id, `vertex/${id}`, `antigravity/${id}`]);
+const googleCatalog = {
+  data: [...qualifiedGoogleIds, ...qualifiedRetiredIds].map((id) => ({ id, owned_by: "google" })),
+};
+const expectedGoogleModels = qualifiedGoogleIds.map((id) => ({
+  id,
+  purpose: "image",
+  name: routedName(id, mediaCapability(id)?.name),
+}));
 const inline = (data = png, mimeType = "image/png") => ({ inlineData: { data, mimeType } });
 const googleResponse = (parts: unknown[] = [inline()]) => ({
   candidates: [{ finishReason: "STOP", content: { parts } }],
@@ -518,14 +531,11 @@ test("Google exact IDs cannot become chat aliases and require live availability,
   const chat = known[0];
   const config = parseConfig({
     aliases: Object.fromEntries(
-      [...googleIds, ...retiredIds].map((id) => [id, `${chat.provider}/${chat.id}`]),
+      [...qualifiedGoogleIds, ...qualifiedRetiredIds].map((id) => [id, `${chat.provider}/${chat.id}`]),
     ),
   });
   assert.deepEqual(mapCatalog(googleCatalog, config, known).models, []);
-  assert.deepEqual(
-    mapMediaCatalog(googleCatalog),
-    googleIds.map((id) => ({ id, purpose: "image" })),
-  );
+  assert.deepEqual(mapMediaCatalog(googleCatalog), expectedGoogleModels);
   assert.deepEqual(
     mapMediaCatalog({
       data: [
@@ -547,11 +557,8 @@ test("retired Imagen IDs reject explicit generation and saved defaults before ne
     }),
   });
   const ctx = { ...context(await home(t)), sessionManager: SessionManager.inMemory() };
-  assert.deepEqual(
-    await listMediaModels(config, ctx),
-    googleIds.map((id) => ({ id, purpose: "image" })),
-  );
-  for (const id of retiredIds) {
+  assert.deepEqual(await listMediaModels(config, ctx), expectedGoogleModels);
+  for (const id of qualifiedRetiredIds) {
     await assert.rejects(
       generateImage(config, { model: id, prompt: "fixture" }, ctx),
       /Retired on Vertex.*Nano Banana/,
@@ -601,7 +608,7 @@ test("Google Gemini models use proxy generateContent with minimal payloads and f
     })}/gateway/v1beta`,
   });
   const ctx = context(await home(t));
-  for (const id of googleIds) {
+  for (const id of qualifiedGoogleIds) {
     expected = id;
     const result = await generateImage(config, { model: id, prompt: "fixture" }, ctx);
     assert.equal(result.details.model, id);
@@ -609,7 +616,7 @@ test("Google Gemini models use proxy generateContent with minimal payloads and f
     assert.equal((await readFile(result.details.files[0].path)).toString("base64"), png);
     assert.deepEqual(result.content[1], { type: "image", data: png, mimeType: "image/png" });
   }
-  assert.equal(requests.length, googleIds.length * 2);
+  assert.equal(requests.length, qualifiedGoogleIds.length * 2);
 });
 
 test("Google preserves every final image, recognizes MIME signatures, and shares the inline preview budget", async (t) => {
@@ -764,4 +771,60 @@ test("Google HTTP errors, redirects, response caps and cancellation never retry 
   await rejected;
   assert.equal(posts, 5);
   assert.deepEqual(await readdir(ctx.cwd), []);
+});
+
+test("qualified Gemini defaults retain the wire ID and fail closed when only bare or another backend remains", async (t) => {
+  const canonical = googleIds[0];
+  const selected = `vertex/${canonical}`;
+  const other = `antigravity/${canonical}`;
+  let advertised = [canonical, selected, other];
+  const posted: string[] = [];
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) => {
+      if (req.method === "GET")
+        return void res.end(JSON.stringify({ data: advertised.map((id) => ({ id })) }));
+      posted.push(req.url ?? "");
+      res.end(JSON.stringify(googleResponse()));
+    }),
+  });
+  const ctx = { ...context(await home(t)), sessionManager: SessionManager.inMemory() };
+  ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+    version: 1,
+    endpoint: config.baseUrl,
+    defaults: { image: selected },
+  });
+  assert.equal((await generateImage(config, { prompt: "fixture" }, ctx)).details.model, selected);
+  assert.equal((await generateImage(config, { prompt: "fixture", model: other }, ctx)).details.model, other);
+  advertised = [canonical, other];
+  await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /not available/);
+  await assert.rejects(generateImage(config, { prompt: "fixture", model: selected }, ctx), /not available/);
+  assert.deepEqual(
+    posted,
+    [selected, other].map((id) => `/v1beta/models/${id}:generateContent`),
+  );
+});
+
+test("recognized backends do not enable xAI media and unknown prefixes do not inherit capabilities", async (t) => {
+  const unsupported = ids.flatMap((id) => [`vertex/${id}`, `antigravity/${id}`]);
+  const unknown = googleIds.flatMap((id) => [`custom/${id}`, `vertex/custom/${id}`]);
+  t.mock.method(globalThis, "fetch", () => assert.fail("Unsupported media must fail before network"));
+  assert.deepEqual(mapMediaCatalog({ data: [...unsupported, ...unknown].map((id) => ({ id })) }), []);
+  const config = parseConfig({});
+  const ctx = context(await home(t));
+  for (const id of unsupported) {
+    assert.equal(mediaCapability(id)?.route, undefined);
+    await assert.rejects(
+      generateImage(config, { model: id, prompt: "fixture" }, ctx),
+      /Unsupported media execution/,
+    );
+    await assert.rejects(
+      generateVideo(config, { model: id, prompt: "fixture" }, ctx),
+      /Unsupported media execution/,
+    );
+  }
+  for (const id of unknown)
+    await assert.rejects(
+      generateImage(config, { model: id, prompt: "fixture" }, ctx),
+      /supported image model/,
+    );
 });

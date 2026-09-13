@@ -62,11 +62,11 @@ In Pi 0.85.1, `pi update --models` does not load package extensions and cannot r
 
 Discovery calls `/v1/models` with a ten-second deadline. Failed requests and malformed responses leave the previous catalog intact. A successful empty catalog removes the discovered entries. Offline chat discovery uses the saved catalog without contacting the proxy.
 
-Pi owns catalog persistence and cancellation. Cached entries are scoped to the connection and alias configuration; credentials are excluded. A saved catalog does not guarantee current upstream access.
+Pi owns catalog persistence and cancellation. Cached entries are scoped to the connection, alias configuration, and mapping policy; credentials are excluded. An upgrade can invalidate saved entries; run `/cliproxyapi-refresh` before offline chat. A saved catalog does not guarantee current upstream access.
 
 ## Model picker
 
-Run `/cli:model` for a searchable live catalog of chat, image, and video models. Rows show friendly names, exact IDs, upstream owners, and capabilities. Search by name (including `nano` or `banana`), ID, owner, or purpose. Unknown models remain visible as unsupported and cannot run.
+Run `/cli:model` for a searchable live catalog of chat, image, and video models. Rows show friendly names, exact IDs, backends, upstream owners, and capabilities. Search by name (including `nano` or `banana`), ID, backend, owner, or purpose. Unknown models remain visible as unsupported and cannot run.
 
 Selecting a chat model uses Pi's session model selection. Selecting an image or video model sets a separate session default; it does not change chat or generate anything. The picker and footer show the media defaults. Use the clear rows to remove either default.
 
@@ -84,9 +84,19 @@ Pi stores media defaults in custom session entries, scoped to the configured pro
 
 Explicit picker and media calls contact the proxy, including in offline chat mode. The picker fetches `/v1/models` on demand. Selecting a chat ID missing from Pi's registry refreshes the native chat catalog first, then uses the effective registry model, including overrides. Listing and media selection do not refresh the chat cache. A post-selection chat refresh has its own 15-second deadline; time spent browsing does not count toward it.
 
+## Backend routing
+
+Set the top-level `prefix` field to `vertex` on Vertex auth records and `antigravity` on Antigravity auth records in CLIProxyAPI. Version 7.3.1 advertises these routes as `vertex/<canonical-id>` and `antigravity/<canonical-id>` through `/v1/models`. With `force-model-prefix: false`, it also retains bare IDs. The extension does not change proxy configuration or restart the proxy.
+
+The picker and chat registry keep each advertised route separate. For example, select `vertex/gemini-2.5-flash-image` for Nano Banana through Vertex or `antigravity/gemini-3.1-flash-image` for Nano Banana 2 through Antigravity. Backend labels apply to chat, image, video, and unknown rows. Bare IDs show **Automatic (proxy routing)**; `owned_by: google` identifies an owner, not a Vertex route. Custom prefixes show **Unknown backend**.
+
+Keep the full ID in selections and media `model` arguments. The registry, defaults, requests, and results retain it. Prefix stripping serves metadata and Gemini adapter capability checks.
+
+Exact `/cli:model select <ID>` and media calls, including stored media defaults, reject missing routes without choosing another model or backend. Pi's native CLI fuzzy matching and saved-chat fallback remain unchanged and can select a different model or route. Confirm the active chat route after startup, or select it with `/cli:model`.
+
 ## Metadata and aliases
 
-Discovery determines availability; Pi's built-in catalogs supply context limits, pricing, input types, and thinking capabilities. Exact IDs are matched against Anthropic, OpenAI, Codex, and Google metadata. Recognized catalog ownership resolves duplicate IDs; ambiguous cross-family matches are skipped.
+Discovery determines availability; Pi's built-in catalogs supply context limits, pricing, input types, and thinking capabilities. The extension matches bare IDs and the canonical part of `vertex/` and `antigravity/` IDs against Anthropic, OpenAI, Codex, and Google metadata. Recognized catalog ownership resolves duplicate metadata IDs, not backend routing; ambiguous cross-family matches are skipped.
 
 The chat catalog skips unknown IDs without guessing capabilities. `/cli:model` shows them as unsupported. To describe a proxy alias, add its canonical reference to `pi-cliproxyapi.json`:
 
@@ -98,9 +108,9 @@ The chat catalog skips unknown IDs without guessing capabilities. `/cli:model` s
 }
 ```
 
-Replace `<canonical-model-id>` with an ID in Pi's Anthropic catalog. References may also start with `openai/`, `openai-codex/`, or `google/`. The proxy still receives `team-chat` as the request ID; aliases change metadata, not routing names.
+Replace `<canonical-model-id>` with an ID in Pi's Anthropic catalog. References may also start with `openai/`, `openai-codex/`, or `google/`. The proxy still receives `team-chat` as the request ID; aliases change metadata, not routing names. Qualified routes can reuse a canonical ID's alias when its reference resolves to one metadata entry. An exact qualified-ID alias takes precedence. Custom prefixes require an explicit chat alias; the extension does not guess their canonical IDs.
 
-Pi's adapters also use IDs for some model-specific behavior. Prefer canonical Gemini IDs for thinking controls; an arbitrary alias does not reproduce every ID-specific adapter feature.
+Pi's adapters also use IDs for some model-specific behavior. Canonical Gemini IDs, including the two recognized routing prefixes, retain native thinking and tool-turn behavior. An arbitrary alias does not reproduce every ID-specific adapter feature.
 
 Use Pi's `models.json` `modelOverrides` for per-model limits, pricing, or compatibility changes. Use its `models` array for a model that has no built-in metadata at all. Updating Pi updates the metadata available to this extension.
 
@@ -141,13 +151,13 @@ Retired Imagen entries (disabled):
 | Imagen 4 Fast | `imagen-4.0-fast-generate-001` |
 | Imagen 4 Ultra | `imagen-4.0-ultra-generate-001` |
 
-Google's March 24, 2026 [Vertex release notes](https://docs.cloud.google.com/vertex-ai/docs/release-notes) direct migration from all five Imagen IDs before June 30, 2026. The extension marks these IDs as retired on Vertex and disables them even if a proxy still advertises them. This conservative policy does not assert that every custom gateway rejects these IDs.
+Google's March 24, 2026 [Vertex release notes](https://docs.cloud.google.com/vertex-ai/docs/release-notes) direct migration from all five Imagen IDs before June 30, 2026. The extension marks these IDs as retired on Vertex and disables bare IDs and their `vertex/` and `antigravity/` forms even if a proxy still advertises them. This conservative policy does not assert that every custom gateway rejects these IDs.
 
 `/cli:model` shows their image purpose and retirement reason; `cliproxyapi_media_models` excludes them. Explicit generation fails before network access. The extension discards stored Imagen defaults without a fallback. Select an available Nano Banana model instead.
 
 Choose a model with `/cli:model` or pass an explicit ID from `cliproxyapi_media_models`. Omit `model` only when that purpose has a session default. An explicit ID takes precedence. Generation rechecks `/v1/models` and rejects missing or hidden IDs, including stale defaults. It does not choose a replacement model or fall back to a more expensive one.
 
-Media discovery runs on demand and has no saved catalog. Google image IDs stay out of the chat catalog even if mapped to a chat alias. Vision input support does not imply image output. Routing prefixes, media aliases, unknown media IDs, Google Veo, and editing endpoints are unsupported.
+Media discovery runs on demand and has no saved catalog. Google image IDs stay out of the chat catalog even if mapped to a chat alias. Vision input support does not imply image output. Both recognized backends support the listed Gemini image models when advertised. Qualified xAI image and video entries remain visible but disabled: these prefixes do not establish xAI execution support. Other prefixes, media aliases, unknown media IDs, Google Veo, and editing endpoints are unsupported.
 
 Example requests to Pi:
 

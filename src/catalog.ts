@@ -34,6 +34,23 @@ export function parseCatalog(value: unknown) {
   });
 }
 
+// Resolve metadata and capabilities without changing registry or request IDs.
+export function modelRoute(id: string) {
+  const match = /^(vertex|antigravity)\/(.+)$/.exec(id);
+  return {
+    metadataId: match?.[2] ?? id,
+    backend: match ? (match[1] === "vertex" ? "Vertex" : "Antigravity") : undefined,
+  };
+}
+
+export function backendLabel(id: string) {
+  return modelRoute(id).backend ?? (id.includes("/") ? "Unknown backend" : "Automatic (proxy routing)");
+}
+
+export function routedName(id: string, name = id) {
+  return `${name} · ${backendLabel(id)}`;
+}
+
 export type MediaPurpose = "image" | "video";
 
 const imagenRetirement = "Retired on Vertex (June 2026); disabled. Select a Nano Banana image model instead.";
@@ -52,19 +69,10 @@ const mediaModels = new Map<
     "grok-imagine-video-1.5-preview",
     { name: "Grok Imagine Video 1.5 Preview", purpose: "video", route: "xai" },
   ],
-  [
-    "gemini-2.5-flash-image",
-    { name: "Nano Banana (Gemini 2.5 Flash Image)", purpose: "image", route: "gemini" },
-  ],
-  [
-    "gemini-3.1-flash-image",
-    { name: "Nano Banana 2 (Gemini 3.1 Flash Image)", purpose: "image", route: "gemini" },
-  ],
-  ["gemini-3-pro-image", { name: "Nano Banana Pro (Gemini 3 Pro Image)", purpose: "image", route: "gemini" }],
-  [
-    "gemini-3.1-flash-lite-image",
-    { name: "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)", purpose: "image", route: "gemini" },
-  ],
+  ["gemini-2.5-flash-image", { name: "Nano Banana", purpose: "image", route: "gemini" }],
+  ["gemini-3.1-flash-image", { name: "Nano Banana 2", purpose: "image", route: "gemini" }],
+  ["gemini-3-pro-image", { name: "Nano Banana Pro", purpose: "image", route: "gemini" }],
+  ["gemini-3.1-flash-lite-image", { name: "Nano Banana 2 Lite", purpose: "image", route: "gemini" }],
   ["imagen-3.0-generate-002", { name: "Imagen 3", purpose: "image", disabledReason: imagenRetirement }],
   [
     "imagen-3.0-fast-generate-001",
@@ -82,7 +90,12 @@ const mediaModels = new Map<
 ]);
 
 export function mediaCapability(id: string) {
-  return mediaModels.get(id);
+  const { metadataId, backend } = modelRoute(id);
+  const capability = mediaModels.get(metadataId);
+  if (backend && capability?.route === "xai") {
+    return { ...capability, route: undefined, disabledReason: `Unsupported media execution on ${backend}.` };
+  }
+  return capability;
 }
 
 export function mediaPurpose(id: string) {
@@ -90,11 +103,15 @@ export function mediaPurpose(id: string) {
 }
 
 export function mapMediaCatalog(value: unknown) {
-  const models = new Map<string, { id: string; purpose: "image" | "video" }>();
+  const models = new Map<string, { id: string; purpose: MediaPurpose; name: string }>();
   for (const entry of parseCatalog(value)) {
-    const purpose = mediaPurpose(entry.id);
-    if (!entry.hidden && purpose && !mediaCapability(entry.id)?.disabledReason)
-      models.set(entry.id, { id: entry.id, purpose });
+    const capability = mediaCapability(entry.id);
+    if (!entry.hidden && capability && !capability.disabledReason)
+      models.set(entry.id, {
+        id: entry.id,
+        purpose: capability.purpose,
+        name: routedName(entry.id, capability.name),
+      });
   }
   return [...models.values()];
 }
@@ -119,17 +136,27 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
       skipped.add(entry.id);
       continue;
     }
-    const alias = Object.hasOwn(config.aliases, entry.id) ? config.aliases[entry.id] : undefined;
+    const { metadataId, backend } = modelRoute(entry.id);
+    const alias = Object.hasOwn(config.aliases, entry.id)
+      ? config.aliases[entry.id]
+      : backend && Object.hasOwn(config.aliases, metadataId)
+        ? config.aliases[metadataId]
+        : undefined;
     const candidates = known.filter((model) =>
-      alias ? `${model.provider}/${model.id}` === alias : model.id === entry.id,
+      alias
+        ? `${model.provider}/${model.id}` === alias
+        : (!entry.id.includes("/") || backend) && model.id === metadataId,
     );
     const families = new Set(
       candidates.map((model) => (model.provider === "openai-codex" ? "openai" : model.provider)),
     );
     const preferred = entry.owner ? owners[entry.owner.toLowerCase()] : undefined;
-    const reference =
-      candidates.find((model) => model.provider === preferred) ??
-      (families.size === 1 ? candidates[0] : undefined);
+    const reference = alias
+      ? candidates.length === 1
+        ? candidates[0]
+        : undefined
+      : (candidates.find((model) => model.provider === preferred) ??
+        (families.size === 1 ? candidates[0] : undefined));
     if (!reference) {
       skipped.add(entry.id);
       continue;
@@ -142,7 +169,7 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
     const model: Model<CpaApi> = {
       ...structuredClone(reference),
       id: entry.id,
-      name: alias ? `${entry.id} (${reference.name})` : reference.name,
+      name: routedName(entry.id, alias ? `${entry.id} (${reference.name})` : reference.name),
       provider: PROVIDER_ID,
       api,
       baseUrl: endpoint(config.baseUrl, api),
@@ -155,6 +182,7 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
               supportsStrictTools: false,
               supportsToolReferences: false,
               supportsMidConvoEffort: false,
+              allowedFallbackModels: undefined,
             }
           : api === "google-generative-ai"
             ? reference.compat

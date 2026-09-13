@@ -130,11 +130,20 @@ Google image models:
 | Nano Banana 2 | `gemini-3.1-flash-image` |
 | Nano Banana Pro | `gemini-3-pro-image` |
 | Nano Banana 2 Lite | `gemini-3.1-flash-lite-image` (only when advertised by the proxy) |
+
+Retired Imagen entries (disabled):
+
+| Friendly name | Exact ID |
+|---------------|----------|
 | Imagen 3 | `imagen-3.0-generate-002` |
 | Imagen 3 Fast | `imagen-3.0-fast-generate-001` |
 | Imagen 4 | `imagen-4.0-generate-001` |
 | Imagen 4 Fast | `imagen-4.0-fast-generate-001` |
 | Imagen 4 Ultra | `imagen-4.0-ultra-generate-001` |
+
+Google's March 24, 2026 [Vertex release notes](https://docs.cloud.google.com/vertex-ai/docs/release-notes) direct migration from all five Imagen IDs before June 30, 2026. The extension marks these IDs as retired on Vertex and disables them even if a proxy still advertises them. This conservative policy does not assert that every custom gateway rejects these IDs.
+
+`/cli:model` shows their image purpose and retirement reason; `cliproxyapi_media_models` excludes them. Explicit generation fails before network access. The extension discards stored Imagen defaults without a fallback. Select an available Nano Banana model instead.
 
 Choose a model with `/cli:model` or pass an explicit ID from `cliproxyapi_media_models`. Omit `model` only when that purpose has a session default. An explicit ID takes precedence. Generation rechecks `/v1/models` and rejects missing or hidden IDs, including stale defaults. It does not choose a replacement model or fall back to a more expensive one.
 
@@ -150,8 +159,6 @@ Check video status for request_id <returned-id>.
 ```
 
 xAI images request `b64_json` with `n=1` through `/v1/images/generations`. Google images use the proxy's `/v1beta/models/{id}:generateContent` route and read inline image data from the Gemini JSON response. Requests contain only the prompt and image-generation options, without chat history, system instructions, or tools.
-
-Imagen uses this same proxy front door, not a proxy `:predict` endpoint. In CLIProxyAPI v7.2.158, the Vertex **service-account** executor converts the request to upstream Imagen `:predict` and normalizes its response to Gemini inline data. The Vertex API-key path lacks this full conversion. Use a compatible service-account configuration in the proxy; the extension does not read Google credentials or bypass the proxy. Antigravity uses a separate proxy authentication path.
 
 For Google images, the extension rejects explicit safety/refusal signals, incomplete responses, text-only results, malformed data, and MIME/signature mismatches before saving any images. It skips `thought: true` parts and saves all final image parts from a single completed candidate, up to 16 images and 256 parts per response. Responses beyond those limits fail rather than drop final images.
 

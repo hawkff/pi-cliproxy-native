@@ -36,10 +36,12 @@ export function parseCatalog(value: unknown) {
 
 export type MediaPurpose = "image" | "video";
 
-// Exact IDs supported by CLIProxyAPI v7.2.158; input vision alone does not imply image output.
+const imagenRetirement = "Retired on Vertex (June 2026); disabled. Select a Nano Banana image model instead.";
+
+// Exact media IDs, including retired entries; vision input alone does not imply image output.
 const mediaModels = new Map<
   string,
-  { name: string; purpose: MediaPurpose; route: "xai" | "gemini" | "imagen" }
+  { name: string; purpose: MediaPurpose; route?: "xai" | "gemini"; disabledReason?: string }
 >([
   ["grok-imagine-image", { name: "Grok Imagine Image", purpose: "image", route: "xai" }],
   ["grok-imagine-image-quality", { name: "Grok Imagine Image Quality", purpose: "image", route: "xai" }],
@@ -63,11 +65,20 @@ const mediaModels = new Map<
     "gemini-3.1-flash-lite-image",
     { name: "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)", purpose: "image", route: "gemini" },
   ],
-  ["imagen-3.0-generate-002", { name: "Imagen 3", purpose: "image", route: "imagen" }],
-  ["imagen-3.0-fast-generate-001", { name: "Imagen 3 Fast", purpose: "image", route: "imagen" }],
-  ["imagen-4.0-generate-001", { name: "Imagen 4", purpose: "image", route: "imagen" }],
-  ["imagen-4.0-fast-generate-001", { name: "Imagen 4 Fast", purpose: "image", route: "imagen" }],
-  ["imagen-4.0-ultra-generate-001", { name: "Imagen 4 Ultra", purpose: "image", route: "imagen" }],
+  ["imagen-3.0-generate-002", { name: "Imagen 3", purpose: "image", disabledReason: imagenRetirement }],
+  [
+    "imagen-3.0-fast-generate-001",
+    { name: "Imagen 3 Fast", purpose: "image", disabledReason: imagenRetirement },
+  ],
+  ["imagen-4.0-generate-001", { name: "Imagen 4", purpose: "image", disabledReason: imagenRetirement }],
+  [
+    "imagen-4.0-fast-generate-001",
+    { name: "Imagen 4 Fast", purpose: "image", disabledReason: imagenRetirement },
+  ],
+  [
+    "imagen-4.0-ultra-generate-001",
+    { name: "Imagen 4 Ultra", purpose: "image", disabledReason: imagenRetirement },
+  ],
 ]);
 
 export function mediaCapability(id: string) {
@@ -82,7 +93,8 @@ export function mapMediaCatalog(value: unknown) {
   const models = new Map<string, { id: string; purpose: "image" | "video" }>();
   for (const entry of parseCatalog(value)) {
     const purpose = mediaPurpose(entry.id);
-    if (!entry.hidden && purpose) models.set(entry.id, { id: entry.id, purpose });
+    if (!entry.hidden && purpose && !mediaCapability(entry.id)?.disabledReason)
+      models.set(entry.id, { id: entry.id, purpose });
   }
   return [...models.values()];
 }

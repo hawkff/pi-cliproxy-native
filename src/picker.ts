@@ -22,7 +22,15 @@ export function pickerCatalog(
   const chat = new Map(mapCatalog(value, config, known).models.map((model) => [model.id, model]));
   const rows = new Map<
     string,
-    { id: string; name: string; owner: string; purpose: string; model?: Model<Api>; supported: boolean }
+    {
+      id: string;
+      name: string;
+      owner: string;
+      purpose: string;
+      model?: Model<Api>;
+      supported: boolean;
+      disabledReason?: string;
+    }
   >();
   for (const entry of parseCatalog(value)) {
     if (entry.hidden || rows.has(entry.id)) continue;
@@ -34,7 +42,8 @@ export function pickerCatalog(
       owner: entry.owner ?? "unknown owner",
       purpose: media?.purpose ?? (model ? "chat" : "unknown / unsupported"),
       model,
-      supported: !!(media || model),
+      supported: !!(media || model) && !media?.disabledReason,
+      disabledReason: media?.disabledReason,
     });
   }
   return [...rows.values()];
@@ -59,7 +68,7 @@ function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string
     ...rows.map((row) => ({
       value: row.id,
       label: `${row.name} (${row.id})`,
-      description: `${row.owner} | ${row.purpose}${defaults.image === row.id || defaults.video === row.id || chatId === row.id ? " | selected" : ""}`,
+      description: `${row.owner} | ${row.purpose}${row.disabledReason ? ` | ${row.disabledReason}` : ""}${defaults.image === row.id || defaults.video === row.id || chatId === row.id ? " | selected" : ""}`,
       supported: row.supported,
     })),
     ...(["image", "video"] as const).map((purpose) => ({
@@ -225,9 +234,10 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
           if (choice === "clear image") delete defaults.image;
           else if (choice === "clear video") delete defaults.video;
           else {
-            const purpose = mediaCapability(choice)?.purpose;
-            if (!purpose) throw new Error("Unsupported CLIProxyAPI media selection.");
-            defaults[purpose] = choice;
+            const capability = mediaCapability(choice);
+            if (!capability || capability.disabledReason)
+              throw new Error("Unsupported CLIProxyAPI media selection.");
+            defaults[capability.purpose] = choice;
           }
           pi.appendEntry(MEDIA_DEFAULTS_ENTRY, { version: 1, endpoint: config.baseUrl, defaults });
           status(ctx);
@@ -238,6 +248,13 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
           return;
         }
         if (input.startsWith("clear")) throw new Error("Usage: /cli:model clear image|video");
+        const disabledReason = input.startsWith("select ")
+          ? mediaCapability(input.slice(7).trim())?.disabledReason
+          : undefined;
+        if (disabledReason) {
+          report(disabledReason, true);
+          return;
+        }
         const signal = AbortSignal.any([...(ctx.signal ? [ctx.signal] : []), AbortSignal.timeout(15000)]);
         const key = await mediaKey(ctx, signal);
         const rows = pickerCatalog(await fetchCatalog(config, key, signal), config);

@@ -259,9 +259,7 @@ export async function generateImage(
       ? { model, prompt: params.prompt, n: 1, response_format: "b64_json" }
       : {
           contents: [{ role: "user", parts: [{ text: params.prompt }] }],
-          ...(route === "gemini"
-            ? { generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 } }
-            : { sampleCount: 1 }),
+          generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 },
         },
   );
   const images = route === "xai" ? [parseImage(result)] : parseGoogleImages(result);

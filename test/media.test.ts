@@ -499,13 +499,15 @@ const googleIds = [
   "gemini-3.1-flash-image",
   "gemini-3-pro-image",
   "gemini-3.1-flash-lite-image",
+];
+const retiredIds = [
   "imagen-3.0-generate-002",
   "imagen-3.0-fast-generate-001",
   "imagen-4.0-generate-001",
   "imagen-4.0-fast-generate-001",
   "imagen-4.0-ultra-generate-001",
 ];
-const googleCatalog = { data: googleIds.map((id) => ({ id, owned_by: "google" })) };
+const googleCatalog = { data: [...googleIds, ...retiredIds].map((id) => ({ id, owned_by: "google" })) };
 const inline = (data = png, mimeType = "image/png") => ({ inlineData: { data, mimeType } });
 const googleResponse = (parts: unknown[] = [inline()]) => ({
   candidates: [{ finishReason: "STOP", content: { parts } }],
@@ -515,10 +517,15 @@ test("Google exact IDs cannot become chat aliases and require live availability,
   const known = builtinCatalog();
   const chat = known[0];
   const config = parseConfig({
-    aliases: Object.fromEntries(googleIds.map((id) => [id, `${chat.provider}/${chat.id}`])),
+    aliases: Object.fromEntries(
+      [...googleIds, ...retiredIds].map((id) => [id, `${chat.provider}/${chat.id}`]),
+    ),
   });
   assert.deepEqual(mapCatalog(googleCatalog, config, known).models, []);
-  assert.equal(mapMediaCatalog(googleCatalog).length, 9);
+  assert.deepEqual(
+    mapMediaCatalog(googleCatalog),
+    googleIds.map((id) => ({ id, purpose: "image" })),
+  );
   assert.deepEqual(
     mapMediaCatalog({
       data: [
@@ -531,7 +538,42 @@ test("Google exact IDs cannot become chat aliases and require live availability,
   );
 });
 
-test("Google Gemini and all five Imagen models use proxy generateContent with minimal payloads and final image normalization", async (t) => {
+test("retired Imagen IDs reject explicit generation and saved defaults before network, even when advertised", async (t) => {
+  let requests = 0;
+  const config = parseConfig({
+    baseUrl: await server(t, (_req, res) => {
+      requests++;
+      res.end(JSON.stringify(googleCatalog));
+    }),
+  });
+  const ctx = { ...context(await home(t)), sessionManager: SessionManager.inMemory() };
+  assert.deepEqual(
+    await listMediaModels(config, ctx),
+    googleIds.map((id) => ({ id, purpose: "image" })),
+  );
+  for (const id of retiredIds) {
+    await assert.rejects(
+      generateImage(config, { model: id, prompt: "fixture" }, ctx),
+      /Retired on Vertex.*Nano Banana/,
+    );
+    await assert.rejects(generateVideo(config, { model: id, prompt: "fixture" }, ctx), /Retired on Vertex/);
+    ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+      version: 1,
+      endpoint: config.baseUrl,
+      defaults: { image: googleIds[0] },
+    });
+    ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+      version: 1,
+      endpoint: config.baseUrl,
+      defaults: { image: id },
+    });
+    await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /No image default/);
+  }
+  assert.equal(requests, 1);
+  assert.deepEqual(await readdir(ctx.cwd), []);
+});
+
+test("Google Gemini models use proxy generateContent with minimal payloads and final image normalization", async (t) => {
   let expected = "";
   const requests: string[] = [];
   const config = parseConfig({
@@ -544,9 +586,7 @@ test("Google Gemini and all five Imagen models use proxy generateContent with mi
       void body(req).then((value) => {
         assert.deepEqual(value, {
           contents: [{ role: "user", parts: [{ text: "fixture" }] }],
-          ...(expected.startsWith("imagen-")
-            ? { sampleCount: 1 }
-            : { generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 } }),
+          generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 },
         });
         res.end(
           JSON.stringify(

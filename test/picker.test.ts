@@ -59,6 +59,85 @@ test("picker catalog labels verified purposes, friendly names and owners without
   assert.deepEqual(searchPickerItems(items, "veo"), []);
 });
 
+test("retired Imagen rows remain visible with reasons but cannot be selected or restored as defaults", async (t) => {
+  const ids = [
+    "imagen-3.0-generate-002",
+    "imagen-3.0-fast-generate-001",
+    "imagen-4.0-generate-001",
+    "imagen-4.0-fast-generate-001",
+    "imagen-4.0-ultra-generate-001",
+  ];
+  const advertised = { data: [...catalog.data, ...ids.map((id) => ({ id, owned_by: "google" }))] };
+  const config = parseConfig({});
+  const rows = pickerCatalog(advertised, config).filter((row) => ids.includes(row.id));
+  assert.equal(rows.length, 5);
+  for (const row of rows) {
+    assert.match(row.name, /^Imagen [34]/);
+    assert.equal(row.purpose, "image");
+    assert.equal(row.supported, false);
+    assert.match(row.disabledReason ?? "", /Retired on Vertex.*Nano Banana/);
+    assert.equal(row.model, undefined);
+  }
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+    assert.equal(init?.method, undefined);
+    requests++;
+    return new Response(JSON.stringify(advertised));
+  });
+  let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+  const notifications: string[] = [];
+  const pi: Pick<ExtensionAPI, "on" | "registerCommand" | "appendEntry" | "setModel"> = {
+    on() {},
+    registerCommand(_name, options) {
+      command = options;
+    },
+    appendEntry() {
+      assert.fail("Retired selection must not save defaults");
+    },
+    async setModel() {
+      assert.fail("Retired selection must not change chat");
+    },
+  };
+  const ctx = {
+    mode: "rpc",
+    hasUI: true,
+    sessionManager: SessionManager.inMemory(),
+    ui: { notify: (text: string) => notifications.push(text), custom: async () => ids[0] },
+    modelRegistry: { getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }) },
+  } as unknown as ExtensionCommandContext;
+  registerModelPicker(pi as ExtensionAPI, config);
+  assert.ok(command);
+  await command.handler("search imagen", ctx);
+  for (const id of ids) assert.ok(notifications.at(-1)?.includes(id));
+  assert.match(notifications.at(-1) ?? "", /Retired on Vertex.*Nano Banana/);
+  for (const id of ids) {
+    await command.handler(`select ${id}`, ctx);
+    assert.match(notifications.at(-1) ?? "", /Retired on Vertex.*Nano Banana/);
+    assert.deepEqual(
+      readMediaDefaults(config, {
+        sessionManager: {
+          getBranch: () => [
+            {
+              type: "custom",
+              customType: MEDIA_DEFAULTS_ENTRY,
+              id: "fixture",
+              parentId: null,
+              timestamp: "fixture",
+              data: { version: 1, endpoint: config.baseUrl, defaults: { image: id, video } },
+            },
+          ],
+        },
+      }),
+      { video },
+    );
+  }
+  assert.equal(requests, 1);
+  await command.handler("", { ...ctx, mode: "tui" });
+  assert.equal(requests, 2);
+  assert.match(notifications.at(-1) ?? "", /unsupported/);
+  assert.deepEqual(ctx.sessionManager.getBranch(), []);
+});
+
 test("ModelPicker handles search, injected keys, paging, unsupported selection, cancel, IME focus and bounded resizing", () => {
   const items = [
     { value: "unknown", label: "Unsupported", description: "unknown / unsupported", supported: false },

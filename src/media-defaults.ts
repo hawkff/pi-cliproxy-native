@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type MediaPurpose, mediaPurpose } from "./catalog.ts";
+import { type MediaPurpose, mediaCapability, mediaPurpose } from "./catalog.ts";
 import { type Config, isModelId, isRecord } from "./config.ts";
 
 export const MEDIA_DEFAULTS_ENTRY = "cliproxyapi-media-defaults";
@@ -17,7 +17,8 @@ export function readMediaDefaults(config: Config, ctx: DefaultsContext) {
     if (data.version !== 1 || !isRecord(data.defaults)) continue;
     for (const purpose of ["image", "video"] as const) {
       const id = data.defaults[purpose];
-      if (isModelId(id) && mediaPurpose(id) === purpose) defaults[purpose] = id;
+      if (isModelId(id) && mediaPurpose(id) === purpose && !mediaCapability(id)?.disabledReason)
+        defaults[purpose] = id;
     }
   }
   return defaults;
@@ -35,6 +36,8 @@ export function resolveMediaModel(
       `No ${purpose} default. Use /cli:model to select one, or pass an explicit model ID from cliproxyapi_media_models.`,
     );
   }
+  const disabledReason = mediaCapability(model)?.disabledReason;
+  if (disabledReason) throw new Error(disabledReason);
   if (mediaPurpose(model) !== purpose) {
     throw new Error(`Choose an explicit supported ${purpose} model from cliproxyapi_media_models.`);
   }

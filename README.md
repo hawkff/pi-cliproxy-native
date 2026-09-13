@@ -86,6 +86,41 @@ Use Pi's `models.json` `modelOverrides` for per-model limits, pricing, or compat
 
 Catalog prices are estimates, not the proxy's bill. Verify limits against the upstream account before increasing them.
 
+## Images and videos
+
+Use the media tools from any chat model after `/login cliproxyapi`. Media models do not appear in `/model`; these tools leave your chat selection unchanged.
+
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `cliproxyapi_media_models` | None | Supported image/video IDs available now |
+| `cliproxyapi_generate_image` | `model`, `prompt` | One saved image and its path; image content for vision-capable chat models |
+| `cliproxyapi_generate_video` | `model`, `prompt`, optional `duration` (integer, 1–15 seconds) | `request_id` for a submitted video |
+| `cliproxyapi_video_status` | `request_id` | One status check: pending, completed with a URL, or failed |
+
+Supported canonical IDs:
+
+- Image: `grok-imagine-image`, `grok-imagine-image-quality`, `grok-imagine-image-2.0`.
+- Video: `grok-imagine-video`, `grok-imagine-video-1.5`, `grok-imagine-video-1.5-preview`.
+
+Choose a model from `cliproxyapi_media_models`. Generation rechecks `/v1/models` and rejects missing or hidden IDs. Media discovery runs on demand and has no saved catalog. Routing prefixes, chat aliases, unknown media IDs, and editing endpoints are unsupported.
+
+Example requests to Pi:
+
+```text
+List available CLIProxyAPI media models.
+Generate an image of a red circle with grok-imagine-image.
+Generate a 1-second video of a red circle moving left with grok-imagine-video.
+Check video status for request_id <returned-id>.
+```
+
+Images request `b64_json` with `n=1`. The extension checks base64 and file signatures, then saves JPEG, PNG, or WebP under a new `.pi/cliproxyapi-image-*/` directory in the working directory. Files use private permissions and do not overwrite existing files. Keep `.pi/` out of version control. Inline previews require a vision-capable chat model and at most 4 MiB of base64; larger images return paths without previews. Use Pi's `read` tool to inspect saved images. URL-only image responses fail without downloading anything.
+
+Video submission returns after the proxy accepts the request, without waiting for generation to finish. Use the returned ID for each later status check, rather than submitting again. The extension reports native `done` as completed and `failed` or `expired` as failed. The extension marks moderation-rejected results as failed and omits their URLs. Tool details retain request IDs, file paths, and final video URLs; the extension does not download videos or send proxy credentials to media URLs. xAI video URLs are temporary.
+
+Media tools use Pi's resolved `cliproxyapi` key and the configured proxy endpoint. Deadlines cover auth and network waits: 15 seconds for listing/status, 60 seconds for video submission, and 180 seconds for images. Catalog fetches retain their ten-second deadline and 4 MiB limit; image responses allow 32 MiB and video responses 64 KiB. Requests reject redirects and report HTTP errors by status, without upstream response bodies. Generation has no automatic retries. Cancellation or a timeout can leave a generation running upstream; check a known video ID before considering another submission.
+
+The wire formats follow CLIProxyAPI v7.2.158's [image handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_images_handlers.go) and [native video handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_videos_handlers.go), with duration/status semantics from [xAI's video documentation](https://docs.x.ai/developers/model-capabilities/video/generation). Availability still depends on your proxy and upstream account.
+
 ## Thinking and subagents
 
 Use `cliproxyapi/<model-id>:high` as the model reference in Pi or pi-subagents. Pi separates the thinking suffix from the model ID; the proxy receives the original ID and native thinking parameters. Keep thinking suffixes out of metadata alias mappings.
@@ -128,7 +163,7 @@ pnpm format
 pnpm check
 ```
 
-GitHub Actions runs type checking, formatting/lint checks, and tests on Node.js 22.19, 24, and 26. Tests use loopback mock servers and temporary Pi directories. They cover catalog discovery, authentication, offline restoration, failure retention, cancellation, native streaming routes, optional tool arguments, and package loading through Pi's CLI. They require no upstream credentials.
+GitHub Actions runs type checking, formatting/lint checks, and tests on Node.js 22.19, 24, and 26. Tests use loopback mock servers and temporary Pi directories. They cover catalog discovery, authentication, offline restoration, failure retention, cancellation, native streaming routes, optional tool arguments, media artifacts/status, and package/tool loading through Pi. They require no upstream credentials.
 
 ## License
 

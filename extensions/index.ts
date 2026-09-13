@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { PROVIDER_ID, parseConfig } from "../src/config.ts";
+import { registerMediaTools } from "../src/media.ts";
 import { createCliproxyProvider } from "../src/provider.ts";
 
 export default async function (pi: ExtensionAPI) {
@@ -21,6 +22,7 @@ export default async function (pi: ExtensionAPI) {
   }
   const config = parseConfig(raw, process.env.CLIPROXYAPI_BASE_URL);
   pi.registerProvider(createCliproxyProvider(config));
+  registerMediaTools(pi, config);
   pi.registerCommand("cliproxyapi-refresh", {
     description: "Refresh the CLIProxyAPI model catalog",
     async handler(args, ctx) {

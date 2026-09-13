@@ -28,19 +28,14 @@ export function builtinCatalog() {
   ];
 }
 
-function validateKey(key: string) {
+export function validateKey(key: string) {
   if (!/^[!-~]{1,4096}$/.test(key)) {
     throw new Error("CLIProxyAPI requires a non-empty API key without whitespace or control characters.");
   }
   return key;
 }
 
-export async function discover(
-  config: Config,
-  key: string,
-  signal: AbortSignal,
-  known: readonly Model<Api>[],
-) {
+export async function fetchCatalog(config: Config, key: string, signal: AbortSignal) {
   validateKey(key);
   const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(10000)]);
   let response: Response;
@@ -82,7 +77,16 @@ export async function discover(
   } finally {
     reader.releaseLock();
   }
-  return mapCatalog(payload, config, known);
+  return payload;
+}
+
+export async function discover(
+  config: Config,
+  key: string,
+  signal: AbortSignal,
+  known: readonly Model<Api>[],
+) {
+  return mapCatalog(await fetchCatalog(config, key, signal), config, known);
 }
 
 export function nonStrictTools(payload: unknown) {

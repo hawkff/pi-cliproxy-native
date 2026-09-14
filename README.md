@@ -68,7 +68,7 @@ Pi owns catalog persistence and cancellation. Cached entries are scoped to the c
 
 Run `/cli:model` for a searchable live catalog of chat, image, and video models. Rows show friendly names, exact IDs, backends, upstream owners, and capabilities. Search by name (including `nano` or `banana`), ID, backend, owner, or purpose. Unknown models remain visible as unsupported and cannot run.
 
-Selecting a chat model uses Pi's session model selection. Selecting an image or video model sets a separate session default; it does not change chat or generate anything. The picker and footer show the media defaults. Use the clear rows to remove either default.
+Selecting a chat model uses Pi's session model selection. Selecting an image or video model sets a separate session default; it does not change chat or generate anything. The picker and footer show the effective media defaults. OpenAI/GPT chats use `gpt-image-2.5-sunburst` automatically unless you select an image default. Clearing that selection restores automatic behavior.
 
 ```text
 /cli:model search banana
@@ -80,7 +80,7 @@ Selecting a chat model uses Pi's session model selection. Selecting an image or 
 
 The terminal picker is keyboard-only; mouse clicks and wheel events do not change its selection. Type to search, use selection keys to navigate, Enter to select, and Escape to cancel. Custom selection keybindings also work. RPC, print, and JSON modes return results without opening a picker; use `select <exact ID>` to choose a model. Print mode writes command results to stderr. JSON mode emits custom-message events; RPC sends notifications. Text listings show at most 100 matches; narrow the query for larger catalogs.
 
-Pi stores media defaults in custom session entries, scoped to the configured proxy endpoint. Reload, resume, and tree navigation restore the current branch's defaults. Forks inherit defaults from their copied branch; new sessions start without them. The extension keeps defaults separate for each endpoint and creates no global media settings or disk cache.
+Pi stores media defaults in custom session entries, scoped to the configured proxy endpoint. Reload, resume, and tree navigation restore the current branch's defaults. Forks inherit selected defaults from their copied branch; new sessions start without explicit selections. Automatic image defaults follow the current chat model without network access or persistence. The extension keeps defaults separate for each endpoint and creates no global media settings or disk cache.
 
 Explicit picker and media calls contact the proxy, including in offline chat mode. The picker fetches `/v1/models` on demand. Selecting a chat ID missing from Pi's registry refreshes the native chat catalog first, then uses the effective registry model, including overrides. Listing and media selection do not refresh the chat cache. A post-selection chat refresh has its own 15-second deadline; time spent browsing does not count toward it.
 
@@ -122,10 +122,12 @@ Use the media tools from any chat model after `/login cliproxyapi`. Media models
 
 | Tool | Arguments | Result |
 |------|-----------|--------|
-| `cliproxyapi_media_models` | None | Supported image/video IDs available now and session defaults |
+| `cliproxyapi_media_models` | None | Supported image/video IDs available now and effective defaults |
 | `cliproxyapi_generate_image` | `prompt`, optional `model` | Saved images and paths; image content for vision-capable chat models |
 | `cliproxyapi_generate_video` | `prompt`, optional `model`, optional `duration` (integer, 1–15 seconds) | `request_id` for a submitted video |
 | `cliproxyapi_video_status` | `request_id` | One status check: pending, completed with a URL, or failed |
+
+OpenAI image models: `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, `gpt-image-2.5`, `gpt-image-2`, and `gpt-image-1.5`. Each ID stays unchanged on the wire, including bare `gpt-image-2.5`. Availability requires an exact live catalog entry.
 
 xAI models:
 
@@ -153,11 +155,15 @@ Retired Imagen entries (disabled):
 
 Google's March 24, 2026 [Vertex release notes](https://docs.cloud.google.com/vertex-ai/docs/release-notes) direct migration from all five Imagen IDs before June 30, 2026. The extension marks these IDs as retired on Vertex and disables bare IDs and their `vertex/` and `antigravity/` forms even if a proxy still advertises them. This conservative policy does not assert that every custom gateway rejects these IDs.
 
-`/cli:model` shows their image purpose and retirement reason; `cliproxyapi_media_models` excludes them. Explicit generation fails before network access. The extension discards stored Imagen defaults without a fallback. Select an available Nano Banana model instead.
+`/cli:model` shows their image purpose and retirement reason; `cliproxyapi_media_models` excludes them. Explicit generation fails before network access. The extension marks stored Imagen defaults invalid without a fallback. Select an available Nano Banana model instead.
 
-Choose a model with `/cli:model` or pass an explicit ID from `cliproxyapi_media_models`. Omit `model` only when that purpose has a session default. An explicit ID takes precedence. Generation rechecks `/v1/models` and rejects missing or hidden IDs, including stale defaults. It does not choose a replacement model or fall back to a more expensive one.
+For requested raster images, use `cliproxyapi_generate_image` with `prompt` and omit `model` to use the effective default. This keeps your chat model unchanged. Selection and discovery do not generate images.
 
-Media discovery runs on demand and has no saved catalog. Google image IDs stay out of the chat catalog even if mapped to a chat alias. Vision input support does not imply image output. Both recognized backends support the listed Gemini image models when advertised. Qualified xAI image and video entries remain visible but disabled: these prefixes do not establish xAI execution support. Other prefixes, media aliases, unknown media IDs, Google Veo, and editing endpoints are unsupported.
+An explicit `model` argument takes precedence over a selected session default, which takes precedence over the automatic image default. Native OpenAI/Codex chats and GPT chat IDs through CLIProxyAPI or other providers use `gpt-image-2.5-sunburst` automatically. Configured OpenAI metadata aliases also qualify; an OpenAI-compatible API alone does not. Other chats require an image selection or explicit ID, and videos require a video selection or explicit ID.
+
+Invalid or disabled saved selections block automatic fallback until you clear or replace them. Generation rechecks `/v1/models` and rejects missing or hidden IDs, including stale defaults. It does not choose a replacement model or fall back to a more expensive one.
+
+Media discovery runs on demand and has no saved catalog. Supported image IDs stay out of the chat catalog even if mapped to a chat alias. Vision input support does not imply image output. Both recognized backends support the listed Gemini image models when advertised. Qualified OpenAI images and xAI image/video entries remain visible but disabled: these prefixes do not establish execution support for them. Other prefixes, media aliases, unknown media IDs, Google Veo, and editing endpoints are unsupported.
 
 Example requests to Pi:
 
@@ -168,7 +174,7 @@ Generate a 1-second video of a red circle moving left with grok-imagine-video.
 Check video status for request_id <returned-id>.
 ```
 
-xAI images request `b64_json` with `n=1` through `/v1/images/generations`. Google images use the proxy's `/v1beta/models/{id}:generateContent` route and read inline image data from the Gemini JSON response. Requests contain only the prompt and image-generation options, without chat history, system instructions, or tools.
+OpenAI images send `model`, `prompt`, and `n=1` to `/v1/images/generations` and read `data[].b64_json`; they omit `response_format`. xAI images use the same route with `response_format: "b64_json"` and `n=1`. Google images use the proxy's `/v1beta/models/{id}:generateContent` route and read inline image data from the Gemini JSON response. Requests contain only the prompt and image-generation options, without chat history, system instructions, or tools.
 
 For Google images, the extension rejects explicit safety/refusal signals, incomplete responses, text-only results, malformed data, and MIME/signature mismatches before saving any images. It skips `thought: true` parts and saves all final image parts from a single completed candidate, up to 16 images and 256 parts per response. Responses beyond those limits fail rather than drop final images.
 
@@ -176,9 +182,13 @@ The extension checks base64 and file signatures, then saves JPEG, PNG, or WebP u
 
 Video submission returns after the proxy accepts the request, without waiting for generation to finish. Use the returned ID for each later status check, rather than submitting again. The extension reports native `done` as completed and `failed` or `expired` as failed. The extension marks moderation-rejected results as failed and omits their URLs. Tool details retain request IDs, file paths, and final video URLs; the extension does not download videos or send proxy credentials to media URLs. xAI video URLs are temporary.
 
-Media tools use Pi's resolved `cliproxyapi` key and the configured proxy endpoint. Deadlines cover auth and network waits: 15 seconds for listing/status, 60 seconds for video submission, and 180 seconds for images. Catalog fetches retain their ten-second deadline and 4 MiB limit; image responses allow 32 MiB and video responses 64 KiB. Requests reject redirects and report HTTP errors by status, without upstream response bodies. Generation has no automatic retries. Cancellation or a timeout can leave a generation running upstream; check a known video ID before considering another submission.
+Media tools use Pi's resolved `cliproxyapi` key and the configured proxy endpoint. Deadlines cover auth and network waits: 15 seconds for listing/status, 60 seconds for video submission, 600 seconds for OpenAI images, and 180 seconds for other images. Image tools report generating and saving progress. Catalog fetches retain their ten-second deadline and 4 MiB limit; image responses allow 32 MiB and video responses 64 KiB. Requests reject redirects and report HTTP errors by status, without upstream response bodies. Generation has no automatic retries. Cancellation or a timeout can leave a generation running upstream; check a known video ID before considering another submission.
 
-The wire formats follow CLIProxyAPI v7.2.158's [image handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_images_handlers.go) and [native video handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_videos_handlers.go), with duration/status semantics from [xAI's video documentation](https://docs.x.ai/developers/model-capabilities/video/generation). Google routing follows the [Gemini handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/gemini/gemini_handlers.go) and [Vertex executor](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/internal/runtime/executor/gemini_vertex_executor.go). The Gemini, image, and video handlers, Vertex executor, and Antigravity execution code are unchanged between v7.2.158 and v7.3.1. Availability still depends on your proxy and upstream account.
+OpenAI image POSTs use a separate HTTP connection without shorter transport timeouts; the overall ten-minute deadline covers both headers and body. These requests ask for identity encoding and reject compressed responses.
+
+OpenAI image routing follows CLIProxyAPI v7.3.1's [image handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.3.1/sdk/api/handlers/openai/openai_images_handlers.go) and [Codex image executor](https://github.com/router-for-me/CLIProxyAPI/blob/v7.3.1/internal/runtime/executor/codex_openai_images.go).
+
+The xAI wire formats follow CLIProxyAPI v7.2.158's [image handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_images_handlers.go) and [native video handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/openai/openai_videos_handlers.go), with duration/status semantics from [xAI's video documentation](https://docs.x.ai/developers/model-capabilities/video/generation). Google routing follows the [Gemini handler](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/sdk/api/handlers/gemini/gemini_handlers.go) and [Vertex executor](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.158/internal/runtime/executor/gemini_vertex_executor.go). The Gemini, image, and video handlers, Vertex executor, and Antigravity execution code are unchanged between v7.2.158 and v7.3.1. Availability still depends on your proxy and upstream account.
 
 ## Thinking and subagents
 
@@ -223,7 +233,7 @@ pnpm --config.verifyDepsBeforeRun=error run format
 pnpm --config.verifyDepsBeforeRun=error run check
 ```
 
-GitHub Actions runs type checking, formatting/lint checks, and tests on Node.js 22.19, 24, and 26. Tests use loopback mock servers and temporary Pi directories. They cover catalog discovery, authentication, offline restoration, failure retention, cancellation, native streaming routes, optional tool arguments, Google and xAI media artifacts/status, searchable selection, session defaults, and package/tool/colon-command loading through Pi. They require no upstream credentials.
+GitHub Actions runs type checking, formatting/lint checks, and tests on Node.js 22.19, 24, and 26. Tests use loopback mock servers and temporary Pi directories. They cover catalog discovery, authentication, offline restoration, failure retention, cancellation, native streaming routes, optional tool arguments, OpenAI/Google/xAI media artifacts and status, searchable selection, automatic and selected defaults, and package/tool/colon-command loading through Pi. They require no upstream credentials.
 
 ## License
 

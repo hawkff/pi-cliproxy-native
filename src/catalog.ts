@@ -58,8 +58,13 @@ const imagenRetirement = "Retired on Vertex (June 2026); disabled. Select a Nano
 // Exact media IDs, including retired entries; vision input alone does not imply image output.
 const mediaModels = new Map<
   string,
-  { name: string; purpose: MediaPurpose; route?: "xai" | "gemini"; disabledReason?: string }
+  { name: string; purpose: MediaPurpose; route?: "xai" | "gemini" | "openai"; disabledReason?: string }
 >([
+  ["gpt-image-2.5-flare", { name: "GPT Image 2.5 Flare", purpose: "image", route: "openai" }],
+  ["gpt-image-2.5-sunburst", { name: "GPT Image 2.5 Sunburst", purpose: "image", route: "openai" }],
+  ["gpt-image-2.5", { name: "GPT Image 2.5", purpose: "image", route: "openai" }],
+  ["gpt-image-2", { name: "GPT Image 2", purpose: "image", route: "openai" }],
+  ["gpt-image-1.5", { name: "GPT Image 1.5", purpose: "image", route: "openai" }],
   ["grok-imagine-image", { name: "Grok Imagine Image", purpose: "image", route: "xai" }],
   ["grok-imagine-image-quality", { name: "Grok Imagine Image Quality", purpose: "image", route: "xai" }],
   ["grok-imagine-image-2.0", { name: "Grok Imagine Image 2.0", purpose: "image", route: "xai" }],
@@ -92,7 +97,7 @@ const mediaModels = new Map<
 export function mediaCapability(id: string) {
   const { metadataId, backend } = modelRoute(id);
   const capability = mediaModels.get(metadataId);
-  if (backend && capability?.route === "xai") {
+  if (backend && (capability?.route === "xai" || capability?.route === "openai")) {
     return { ...capability, route: undefined, disabledReason: `Unsupported media execution on ${backend}.` };
   }
   return capability;

@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { subscribe, unsubscribe } from "node:diagnostics_channel";
 import { once } from "node:events";
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { type ClientRequest, createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { type TestContext, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { mapCatalog, mapMediaCatalog, mediaCapability, routedName } from "../src/catalog.ts";
 import { PROVIDER_ID, parseConfig } from "../src/config.ts";
-import { generateImage, generateVideo, listMediaModels, videoStatus } from "../src/media.ts";
+import {
+  generateImage,
+  generateVideo,
+  listMediaModels,
+  registerMediaTools,
+  videoStatus,
+} from "../src/media.ts";
 import { MEDIA_DEFAULTS_ENTRY } from "../src/media-defaults.ts";
 import { builtinCatalog } from "../src/provider.ts";
 
@@ -827,4 +834,498 @@ test("recognized backends do not enable xAI media and unknown prefixes do not in
       generateImage(config, { model: id, prompt: "fixture" }, ctx),
       /supported image model/,
     );
+});
+
+const openaiIds = [
+  "gpt-image-2.5-flare",
+  "gpt-image-2.5-sunburst",
+  "gpt-image-2.5",
+  "gpt-image-2",
+  "gpt-image-1.5",
+];
+const openaiCatalog = { data: openaiIds.map((id) => ({ id, owned_by: "openai" })) };
+
+test("OpenAI image IDs are image-only, preserve all wire IDs, and reject unsupported backend execution", async (t) => {
+  const known = builtinCatalog();
+  const chat = known[0];
+  const qualified = openaiIds.flatMap((id) => [`vertex/${id}`, `antigravity/${id}`]);
+  const config = parseConfig({
+    aliases: Object.fromEntries(
+      [...openaiIds, ...qualified].map((id) => [id, `${chat.provider}/${chat.id}`]),
+    ),
+  });
+  assert.deepEqual(
+    mapCatalog({ data: [...openaiIds, ...qualified].map((id) => ({ id })) }, config, known).models,
+    [],
+  );
+  assert.deepEqual(
+    mapMediaCatalog(openaiCatalog).map(({ id, purpose }) => ({ id, purpose })),
+    openaiIds.map((id) => ({ id, purpose: "image" })),
+  );
+  const ctx = context(await home(t));
+  t.mock.method(globalThis, "fetch", () => assert.fail("Unsupported routes must not access the network"));
+  for (const id of qualified) {
+    assert.equal(mediaCapability(id)?.purpose, "image");
+    await assert.rejects(
+      generateImage(config, { model: id, prompt: "fixture" }, ctx),
+      /Unsupported media execution/,
+    );
+  }
+  for (const id of openaiIds.flatMap((id) => [`openai/${id}`, `custom/${id}`, `vertex/custom/${id}`])) {
+    assert.equal(mediaCapability(id), undefined);
+    await assert.rejects(
+      generateImage(config, { model: id, prompt: "fixture" }, ctx),
+      /supported image model/,
+    );
+  }
+});
+
+test("all five OpenAI IDs POST one image without response_format and reuse bounded private artifact validation", async (t) => {
+  const cwd = await home(t);
+  const ctx = context(cwd);
+  let response: unknown;
+  let expected = "";
+  let posts = 0;
+  const config = parseConfig({
+    baseUrl: `${await server(t, (req, res) => {
+      assert.equal(req.headers.authorization, `Bearer ${key}`);
+      assert.equal(req.headers["x-extra"], undefined);
+      if (req.method === "GET") {
+        assert.equal(req.url, "/gateway/v1/models");
+        return void res.end(JSON.stringify(openaiCatalog));
+      }
+      assert.equal(req.url, "/gateway/v1/images/generations");
+      assert.equal(req.method, "POST");
+      assert.equal(req.headers["accept-encoding"], "identity");
+      posts++;
+      void body(req).then((value) => {
+        assert.deepEqual(value, { model: expected, prompt: "fixture", n: 1 });
+        res.end(JSON.stringify(response));
+      });
+    })}/gateway/v1`,
+  });
+  for (const id of openaiIds) {
+    expected = id;
+    for (const [data, mimeType] of [
+      [png, "image/png"],
+      [jpeg, "image/jpeg"],
+      [webp, "image/webp"],
+    ]) {
+      response = { data: [{ b64_json: data }] };
+      const progress: string[] = [];
+      const result = await generateImage(config, { model: id, prompt: "fixture" }, ctx, undefined, (text) =>
+        progress.push(text),
+      );
+      assert.deepEqual(progress, ["Generating image...", "Saving image..."]);
+      assert.equal(result.details.model, id);
+      assert.equal((await readFile(result.details.files[0].path)).toString("base64"), data);
+      assert.equal((await stat(result.details.files[0].path)).mode & 0o777, 0o600);
+      assert.equal((await stat(resolve(result.details.files[0].path, ".."))).mode & 0o777, 0o700);
+      assert.deepEqual(result.content[1], { type: "image", data, mimeType });
+    }
+    const before = await readdir(join(cwd, ".pi"));
+    for (const invalid of [
+      null,
+      {},
+      { data: [] },
+      { data: [{ url: "https://must-not-contact.example" }] },
+      { data: [{ b64_json: "!!!!" }] },
+      { data: [{ b64_json: "aGVsbG8=" }] },
+      { data: [{ b64_json: png }, { b64_json: png }] },
+    ]) {
+      response = invalid;
+      await assert.rejects(generateImage(config, { model: id, prompt: "fixture" }, ctx), /CLIProxyAPI/);
+    }
+    assert.deepEqual(await readdir(join(cwd, ".pi")), before);
+  }
+  assert.equal(posts, openaiIds.length * 10);
+});
+
+test("OpenAI automatic and selected defaults recheck exact live availability without fallback or implicit generation", async (t) => {
+  let advertised: object[] = openaiCatalog.data;
+  const posted: string[] = [];
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) => {
+      if (req.method === "GET") return void res.end(JSON.stringify({ data: advertised }));
+      void body(req).then((value) => {
+        assert.ok(value && typeof value === "object" && "model" in value);
+        posted.push(String(value.model));
+        res.end(JSON.stringify({ data: [{ b64_json: png }] }));
+      });
+    }),
+  });
+  const ctx = {
+    ...context(await home(t)),
+    model: builtinCatalog().find((model) => model.provider === "openai-codex"),
+    sessionManager: SessionManager.inMemory(),
+  };
+  assert.ok(ctx.model);
+  await listMediaModels(config, ctx);
+  assert.deepEqual(posted, []);
+  assert.equal((await generateImage(config, { prompt: "fixture" }, ctx)).details.model, openaiIds[1]);
+  ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+    version: 1,
+    endpoint: config.baseUrl,
+    defaults: { image: openaiIds[0] },
+  });
+  assert.equal((await generateImage(config, { prompt: "fixture" }, ctx)).details.model, openaiIds[0]);
+  assert.equal(
+    (await generateImage(config, { prompt: "fixture", model: openaiIds[2] }, ctx)).details.model,
+    openaiIds[2],
+  );
+  for (const hidden of [true, false]) {
+    advertised = [
+      ...openaiCatalog.data.filter(({ id }) => id !== openaiIds[0]),
+      ...(hidden ? [{ id: openaiIds[0], visibility: "hide" }] : []),
+    ];
+    await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /not available/);
+  }
+  for (const defaults of [
+    null,
+    [],
+    { image: null },
+    { image: "unknown-image" },
+    { image: "bad\nvalue" },
+    { image: videoModel },
+    { image: retiredIds[0] },
+  ]) {
+    ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+      version: 1,
+      endpoint: config.baseUrl,
+      defaults,
+    });
+    await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /No image default/);
+  }
+  ctx.sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+    version: 1,
+    endpoint: config.baseUrl,
+    defaults: {},
+  });
+  advertised = [];
+  await assert.rejects(generateImage(config, { prompt: "fixture" }, ctx), /not available/);
+  assert.deepEqual(posted, [openaiIds[1], openaiIds[0], openaiIds[2]]);
+});
+
+test("OpenAI overall deadline remains 600000ms and caller cancellation bounds each phase without retries", async (t) => {
+  let elapsed = 0;
+  const deadlines: { milliseconds: number; expiresAt: number; controller: AbortController }[] = [];
+  const advance = (milliseconds: number) => {
+    elapsed += milliseconds;
+    for (const deadline of deadlines) if (deadline.expiresAt <= elapsed) deadline.controller.abort();
+  };
+  t.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+    const controller = new AbortController();
+    deadlines.push({ milliseconds, expiresAt: elapsed + milliseconds, controller });
+    return controller.signal;
+  });
+  const ctx = context(await home(t));
+  for (const phase of [
+    "long-wait",
+    "deadline",
+    "deadline-body",
+    "auth",
+    "catalog",
+    "generating",
+    "post",
+    "body",
+    "saving",
+  ] as const) {
+    deadlines.length = 0;
+    elapsed = 0;
+    const arrived = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const caller = new AbortController();
+    let posts = 0;
+    const config = parseConfig({
+      baseUrl: await server(t, (req, res) => {
+        if (req.url === "/v1/models" && phase !== "catalog")
+          return void res.end(JSON.stringify(openaiCatalog));
+        if (req.method === "POST") posts++;
+        if (phase === "saving") return void res.end(JSON.stringify({ data: [{ b64_json: png }] }));
+        if (phase === "body" || phase === "deadline-body") res.write('{"data":[');
+        arrived.resolve();
+        if (phase === "long-wait")
+          void finish.promise.then(() => res.end(JSON.stringify({ data: [{ b64_json: png }] })));
+      }),
+    });
+    const progress: string[] = [];
+    const running = generateImage(
+      config,
+      { model: openaiIds[1], prompt: "fixture" },
+      phase === "auth"
+        ? {
+            ...ctx,
+            modelRegistry: {
+              getProviderAuth: () => {
+                arrived.resolve();
+                return new Promise<never>(() => {});
+              },
+            },
+          }
+        : ctx,
+      caller.signal,
+      (text) => {
+        progress.push(text);
+        if ((phase === "saving" && text === "Saving image...") || phase === "generating") caller.abort();
+      },
+    );
+    if (phase === "saving" || phase === "generating") {
+      await assert.rejects(running);
+    } else {
+      const settled = phase === "long-wait" ? running : assert.rejects(running);
+      await arrived.promise;
+      assert.equal(deadlines[0].milliseconds, 600000);
+      assert.ok(!deadlines.some(({ milliseconds }) => milliseconds === 180000));
+      if (phase === "long-wait") {
+        advance(180001);
+        assert.equal(deadlines[0].controller.signal.aborted, false);
+        advance(419998);
+        assert.equal(deadlines[0].controller.signal.aborted, false);
+        assert.deepEqual(progress, ["Generating image..."]);
+        finish.resolve();
+        const result = await running;
+        assert.equal(result.details.model, openaiIds[1]);
+        assert.deepEqual(progress, ["Generating image...", "Saving image..."]);
+      } else if (phase === "deadline" || phase === "deadline-body") advance(600000);
+      else caller.abort();
+      await settled;
+    }
+    assert.equal(posts, phase === "auth" || phase === "catalog" || phase === "generating" ? 0 : 1);
+    if (phase !== "long-wait") assert.ok(phase === "saving" || !progress.includes("Saving image..."));
+  }
+  assert.equal((await readdir(join(ctx.cwd, ".pi"))).length, 1);
+});
+
+test("OpenAI tool metadata, effective listing and progress stay local until execution and errors never retry", async (t) => {
+  let mode = "success";
+  let posts = 0;
+  let redirects = 0;
+  const redirectTarget = await server(t, (_req, res) => {
+    redirects++;
+    res.end(key);
+  });
+  const config = parseConfig({
+    baseUrl: await server(t, (req, res) => {
+      if (req.method === "GET") return void res.end(JSON.stringify(openaiCatalog));
+      assert.equal(req.url, "/v1/images/generations");
+      posts++;
+      if (mode === "http") res.writeHead(403).end(key);
+      else if (mode === "redirect") res.writeHead(307, { location: redirectTarget }).end(key);
+      else if (mode === "oversized") res.end("x".repeat(32 * 1024 * 1024 + 1));
+      else if (mode === "malformed") res.end(key);
+      else if (mode === "upgrade") res.writeHead(101, { connection: "Upgrade", upgrade: "fixture" }).end();
+      else if (mode === "disconnect") res.destroy();
+      else if (mode === "incomplete") {
+        res.write('{"data":[');
+        res.socket?.destroy();
+      } else if (mode === "encoded") res.writeHead(200, { "content-encoding": "gzip" }).end(key);
+      else res.end(JSON.stringify({ data: [{ b64_json: png }] }));
+    }),
+  });
+  const tools: Parameters<ExtensionAPI["registerTool"]>[0][] = [];
+  registerMediaTools(
+    {
+      registerTool(tool) {
+        tools.push(tool as unknown as (typeof tools)[number]);
+      },
+    } as ExtensionAPI,
+    config,
+  );
+  const image = tools.find((tool) => tool.name === "cliproxyapi_generate_image");
+  assert.ok(image);
+  assert.ok(image.promptSnippet?.includes("raster"));
+  assert.ok(image.promptGuidelines?.every((line) => line.includes("cliproxyapi_generate_image")));
+  assert.match(image.promptGuidelines?.join(" ") ?? "", /Omit model.*keep the current chat model/);
+  const ctx = {
+    ...context(await home(t)),
+    model: builtinCatalog().find((model) => model.provider === "openai-codex"),
+  } as unknown as ExtensionContext;
+  const listed = await tools[0].execute("fixture", {}, undefined, undefined, ctx);
+  assert.deepEqual(listed.details, {
+    models: mapMediaCatalog(openaiCatalog),
+    defaults: { image: openaiIds[1] },
+    automatic: openaiIds[1],
+  });
+  assert.equal(posts, 0);
+  const updates: string[] = [];
+  await image.execute(
+    "fixture",
+    { prompt: "fixture" },
+    undefined,
+    (result) => updates.push(JSON.stringify(result)),
+    ctx,
+  );
+  assert.match(updates[0], /Generating image/);
+  assert.match(updates[1], /Saving image/);
+  for (const next of [
+    "http",
+    "redirect",
+    "oversized",
+    "malformed",
+    "disconnect",
+    "incomplete",
+    "encoded",
+    "upgrade",
+  ]) {
+    mode = next;
+    await assert.rejects(
+      image.execute("fixture", { prompt: "fixture" }, undefined, undefined, ctx),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(!error.message.includes(key));
+        return true;
+      },
+    );
+  }
+  assert.equal(posts, 9);
+  assert.equal(redirects, 0);
+});
+
+test("OpenAI native transport completes delayed headers and bodies beyond fetch's 300000ms limits", async (t) => {
+  const cwd = await home(t);
+  for (const phase of ["headers", "body"]) {
+    await t.test(phase, async () => {
+      await promisify(execFile)(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+      import assert from 'node:assert/strict';
+      import { createServer, globalAgent } from 'node:http';
+      import { once } from 'node:events';
+      import { subscribe } from 'node:diagnostics_channel';
+      import { mock } from 'node:test';
+      import { generateImage } from ${JSON.stringify(pathToFileURL(resolve("src/media.ts")).href)};
+      import { parseConfig } from ${JSON.stringify(pathToFileURL(resolve("src/config.ts")).href)};
+      const phase = ${JSON.stringify(phase)};
+      const originalTimeout = globalThis.setTimeout;
+      let tick;
+      mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+        if (fn.name === 'onTick' && ms === 499) tick = fn;
+        return originalTimeout(fn, ms, ...args);
+      });
+      let ready = Promise.withResolvers();
+      let response;
+      let nativeRequest;
+      let posts = 0;
+      subscribe('undici:request:headers', ({ request }) => {
+        if (phase === 'body' && request.method === 'POST') ready.resolve();
+      });
+      subscribe('http.client.request.start', ({ request }) => {
+        if (request.method !== 'POST') return;
+        nativeRequest = request;
+        request.once('response', incoming => incoming.once('data', () => ready.resolve()));
+      });
+      const server = createServer((req, res) => {
+        req.resume();
+        if (req.url === '/v1/models') return res.end(JSON.stringify(${JSON.stringify(openaiCatalog)}));
+        assert.equal(req.method, 'POST');
+        if (req.url === '/v1/images/generations') posts++;
+        else assert.equal(req.url, '/control');
+        response = res;
+        if (phase === 'body') res.write('{"data":[');
+        else ready.resolve();
+      });
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const baseUrl = 'http://127.0.0.1:' + server.address().port;
+      const caller = new AbortController();
+      const advanceTransport = async () => {
+        await ready.promise;
+        await new Promise(setImmediate);
+        assert.equal(typeof tick, 'function', 'Unsupported bundled fetch timer: ' + process.version);
+        for (let i = 0; i < 604; i++) tick();
+        await new Promise(setImmediate);
+      };
+      try {
+        // Validate the accelerated transport clock against real fetch before testing the image POST.
+        const control = fetch(baseUrl + '/control', { method: 'POST', signal: caller.signal })
+          .then(res => res.text()).then(() => null, error => error.cause?.code);
+        await advanceTransport();
+        assert.equal(await control, phase === 'headers' ? 'UND_ERR_HEADERS_TIMEOUT' : 'UND_ERR_BODY_TIMEOUT');
+        ready = Promise.withResolvers();
+        const ctx = { cwd: process.cwd(), model: undefined, modelRegistry: {
+          getProviderAuth: async () => ({ auth: { apiKey: ${JSON.stringify(key)} } })
+        } };
+        const result = generateImage(parseConfig({ baseUrl }),
+          { model: ${JSON.stringify(openaiIds[1])}, prompt: 'fixture' }, ctx, caller.signal)
+          .then(value => ({ value }), error => ({ error }));
+        await advanceTransport();
+        assert.equal(caller.signal.aborted, false);
+        response.end(phase === 'body'
+          ? JSON.stringify({ b64_json: ${JSON.stringify(png)} }) + ']}'
+          : JSON.stringify({ data: [{ b64_json: ${JSON.stringify(png)} }] }));
+        const settled = await result;
+        assert.equal(settled.error, undefined);
+        assert.ok(nativeRequest);
+        assert.notEqual(nativeRequest.agent, globalAgent);
+        assert.equal(nativeRequest.agent.options.timeout ?? 0, 0);
+        assert.equal(nativeRequest.socket.timeout ?? 0, 0);
+        assert.equal(settled.value.details.model, ${JSON.stringify(openaiIds[1])});
+        assert.equal(posts, 1);
+      } finally {
+        caller.abort();
+        mock.restoreAll();
+        server.closeAllConnections();
+        server.close();
+      }
+    `,
+        ],
+        { cwd, timeout: 15000, env: { PATH: process.env.PATH, HOME: cwd } },
+      );
+    });
+  }
+});
+
+test("OpenAI caller cancellation and overall timeout destroy an incoming body after partial data", {
+  timeout: 15000,
+}, async (t) => {
+  const deadlines: { milliseconds: number; controller: AbortController }[] = [];
+  t.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+    const controller = new AbortController();
+    deadlines.push({ milliseconds, controller });
+    return controller.signal;
+  });
+  const ctx = context(await home(t));
+  for (const phase of ["caller", "deadline"]) {
+    deadlines.length = 0;
+    const partial = Promise.withResolvers<void>();
+    const closed = Promise.withResolvers<void>();
+    const onRequest = (message: unknown) => {
+      const { request } = message as { request: ClientRequest };
+      if (request.method === "POST")
+        request.once("response", (incoming) => {
+          incoming.once("data", () => partial.resolve());
+          incoming.once("close", () => closed.resolve());
+        });
+    };
+    subscribe("http.client.request.start", onRequest);
+    let posts = 0;
+    const config = parseConfig({
+      baseUrl: await server(t, (req, res) => {
+        if (req.method === "GET") return void res.end(JSON.stringify(openaiCatalog));
+        posts++;
+        res.write('{"data":[');
+      }),
+    });
+    const caller = new AbortController();
+    try {
+      const rejected = assert.rejects(
+        generateImage(config, { model: openaiIds[1], prompt: "fixture" }, ctx, caller.signal),
+        /media response is invalid, incomplete, cancelled/,
+      );
+      await partial.promise;
+      assert.equal(deadlines[0].milliseconds, 600000);
+      if (phase === "caller") caller.abort();
+      else deadlines[0].controller.abort();
+      await rejected;
+      await closed.promise;
+      assert.equal(posts, 1);
+    } finally {
+      caller.abort();
+      unsubscribe("http.client.request.start", onRequest);
+    }
+  }
+  assert.deepEqual(await readdir(ctx.cwd), []);
 });

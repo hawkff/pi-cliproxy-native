@@ -11,7 +11,12 @@ import {
 import { backendLabel, mapCatalog, mediaCapability, parseCatalog, routedName } from "./catalog.ts";
 import { type Config, PROVIDER_ID } from "./config.ts";
 import { mediaKey } from "./media.ts";
-import { MEDIA_DEFAULTS_ENTRY, type MediaDefaults, readMediaDefaults } from "./media-defaults.ts";
+import {
+  effectiveMediaDefaults,
+  MEDIA_DEFAULTS_ENTRY,
+  type MediaDefaults,
+  readMediaDefaults,
+} from "./media-defaults.ts";
 import { builtinCatalog, fetchCatalog } from "./provider.ts";
 
 export function pickerCatalog(
@@ -61,9 +66,9 @@ export function searchPickerItems(items: readonly PickerItem[], query: string) {
   );
 }
 
-function defaultsLabel(defaults: MediaDefaults) {
-  const label = (id?: string) => (id ? routedName(id) : "none");
-  return `Image: ${label(defaults.image)} | Video: ${label(defaults.video)}`;
+function defaultsLabel(defaults: MediaDefaults, automatic?: string) {
+  const label = (id?: string | null) => (id === null ? "invalid / disabled" : id ? routedName(id) : "none");
+  return `Image: ${label(defaults.image)}${automatic ? " (automatic default)" : ""} | Video: ${label(defaults.video)}`;
 }
 
 function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string) {
@@ -77,7 +82,7 @@ function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string
     ...(["image", "video"] as const).map((purpose) => ({
       value: `clear ${purpose}`,
       label: `Clear ${purpose} default`,
-      description: defaults[purpose] ?? "none",
+      description: defaults[purpose] === null ? "invalid / disabled" : (defaults[purpose] ?? "none"),
       supported: true,
     })),
   ];
@@ -211,10 +216,12 @@ export class ModelPicker extends Container implements Focusable {
 
 export function registerModelPicker(pi: ExtensionAPI, config: Config) {
   const status = (ctx: ExtensionContext) => {
-    if (ctx.hasUI) ctx.ui.setStatus("cliproxyapi-media", defaultsLabel(readMediaDefaults(config, ctx)));
+    const { defaults, automatic } = effectiveMediaDefaults(config, ctx);
+    if (ctx.hasUI) ctx.ui.setStatus("cliproxyapi-media", defaultsLabel(defaults, automatic));
   };
   pi.on("session_start", (_event, ctx) => status(ctx));
   pi.on("session_tree", (_event, ctx) => status(ctx));
+  pi.on("model_select", (event, ctx) => status({ ...ctx, model: event.model }));
 
   pi.registerCommand("cli:model", {
     description: "Search CLIProxyAPI chat/image/video models; select a chat model or session media default",
@@ -247,7 +254,8 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
           }
           pi.appendEntry(MEDIA_DEFAULTS_ENTRY, { version: 1, endpoint: config.baseUrl, defaults });
           status(ctx);
-          report(defaultsLabel(defaults));
+          const effective = effectiveMediaDefaults(config, ctx);
+          report(defaultsLabel(effective.defaults, effective.automatic));
         };
         if (clear) {
           save(`clear ${clear}`);
@@ -264,7 +272,7 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
         const signal = AbortSignal.any([...(ctx.signal ? [ctx.signal] : []), AbortSignal.timeout(15000)]);
         const key = await mediaKey(ctx, signal);
         const rows = pickerCatalog(await fetchCatalog(config, key, signal), config);
-        const defaults = readMediaDefaults(config, ctx);
+        const { defaults, automatic } = effectiveMediaDefaults(config, ctx);
         const items = pickerItems(
           rows,
           defaults,
@@ -280,7 +288,7 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
                 new ModelPicker(
                   items,
                   query,
-                  defaultsLabel(defaults),
+                  defaultsLabel(defaults, automatic),
                   theme,
                   kb,
                   () => tui.terminal.rows,
@@ -292,7 +300,7 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
             const matches = searchPickerItems(items, query);
             report(
               [
-                defaultsLabel(defaults),
+                defaultsLabel(defaults, automatic),
                 ...matches.slice(0, 100).map((item) => `${item.label} | ${item.description}`),
                 ...(matches.length > 100
                   ? [`Showing 100 of ${matches.length}; narrow with /cli:model search <query>.`]

@@ -164,7 +164,7 @@ function route(streams: ProviderStreams, baseUrl: string): ProviderStreams {
 export function createCliproxyProvider(config: Config, known: readonly Model<Api>[] = builtinCatalog()) {
   const standardAuth = envApiKeyAuth("CLIProxyAPI API key", ["CLIPROXYAPI_API_KEY"]);
   const scope = createHash("sha256")
-    .update(JSON.stringify([2, config]))
+    .update(JSON.stringify([3, config]))
     .digest("hex");
   const provider = createProvider<CpaApi>({
     id: PROVIDER_ID,

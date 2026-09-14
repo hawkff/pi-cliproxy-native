@@ -16,7 +16,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, KeybindingsManager, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import { isRecord, parseConfig } from "../src/config.ts";
-import { MEDIA_DEFAULTS_ENTRY, readMediaDefaults, resolveMediaModel } from "../src/media-defaults.ts";
+import {
+  automaticImageDefault,
+  effectiveMediaDefaults,
+  MEDIA_DEFAULTS_ENTRY,
+  OPENAI_IMAGE_DEFAULT,
+  readMediaDefaults,
+  resolveMediaModel,
+} from "../src/media-defaults.ts";
 import { ModelPicker, pickerCatalog, registerModelPicker, searchPickerItems } from "../src/picker.ts";
 import { builtinCatalog } from "../src/provider.ts";
 
@@ -128,7 +135,7 @@ test("retired Imagen rows remain visible with reasons but cannot be selected or 
           ],
         },
       }),
-      { video },
+      { image: null, video },
     );
   }
   assert.equal(requests, 1);
@@ -326,7 +333,12 @@ test("defaults restore only current branch and endpoint, survive reload/fork and
       endpoint: config.baseUrl,
       defaults,
     });
-    assert.deepEqual(readMediaDefaults(config, ctx), {});
+    assert.deepEqual(
+      readMediaDefaults(config, ctx),
+      defaults === null || Array.isArray(defaults) || "video" in defaults
+        ? { image: null, video: null }
+        : { image: null },
+    );
     assert.throws(() => resolveMediaModel(config, ctx, "image"), /No image default/);
   }
   sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
@@ -334,7 +346,7 @@ test("defaults restore only current branch and endpoint, survive reload/fork and
     endpoint: config.baseUrl,
     defaults: { image },
   });
-  assert.deepEqual(readMediaDefaults(config, ctx), {});
+  assert.deepEqual(readMediaDefaults(config, ctx), { image: null, video: null });
 });
 
 test("picker listing and selection do only GETs, chat uses setModel, and lifecycle restoration reads the branch", async (t) => {
@@ -759,4 +771,192 @@ test("picker labels backend routes across every purpose, selects exact effective
   assert.equal(selected.length, 2);
   assert.equal(refreshes, 1);
   assert.deepEqual(readMediaDefaults(config, ctx), { image: `vertex/${image}` });
+});
+
+test("automatic image default detects OpenAI/GPT families and explicit metadata aliases, not compatible APIs", () => {
+  const config = parseConfig({
+    aliases: {
+      "team-chat": "openai-codex/gpt-5",
+      "gpt-alias": "anthropic/claude-fixture",
+      "vertex/team-chat": "google/gemini-fixture",
+    },
+  });
+  for (const [provider, id] of [
+    ["openai", "o3"],
+    ["openai-codex", "codex-fixture"],
+    ["cliproxyapi", "gpt-5"],
+    ["other", "gpt-5.4"],
+    ["other", "openai/gpt-5"],
+    ["other", "chatgpt-4o-latest"],
+    ["other", "o3-mini"],
+    ["cliproxyapi", "vertex/gpt-5"],
+    ["cliproxyapi", "team-chat"],
+    ["cliproxyapi", "antigravity/team-chat"],
+  ]) {
+    const ctx = { model: { ...chat, provider, id } };
+    assert.equal(automaticImageDefault(config, ctx), OPENAI_IMAGE_DEFAULT, `${provider}/${id}`);
+    assert.equal(resolveMediaModel(config, ctx, "image"), OPENAI_IMAGE_DEFAULT);
+    assert.throws(() => resolveMediaModel(config, ctx, "video"), /No video default/);
+    assert.deepEqual(readMediaDefaults(config, ctx), {});
+  }
+  for (const id of [
+    "claude-fixture",
+    "gemini-fixture",
+    "llama-4",
+    "grok-4",
+    "deepseek",
+    "unknown",
+    "custom/gpt-5",
+    "gpt-image-2.5",
+  ]) {
+    for (const api of ["openai-completions", "openai-responses"] as const) {
+      const ctx = { model: { ...chat, provider: "other", id, api } };
+      assert.equal(automaticImageDefault(config, ctx), undefined, id);
+      assert.throws(() => resolveMediaModel(config, ctx, "image"), /No image default/);
+    }
+  }
+  for (const id of ["gpt-alias", "vertex/team-chat"])
+    assert.equal(
+      automaticImageDefault(config, { model: { ...chat, provider: "cliproxyapi", id } }),
+      undefined,
+    );
+  assert.equal(automaticImageDefault(config, {}), undefined);
+});
+
+test("effective defaults preserve invalid selection barriers, explicit precedence, endpoint and branch isolation", () => {
+  const config = parseConfig({});
+  const sessionManager = SessionManager.inMemory();
+  const ctx = { sessionManager, model: { ...chat, provider: "openai-codex" } };
+  const save = (defaults: unknown, version = 1) =>
+    sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, { version, endpoint: config.baseUrl, defaults });
+  const empty = save({});
+  assert.equal(resolveMediaModel(config, ctx, "image"), OPENAI_IMAGE_DEFAULT);
+  const explicit = save({ image, video });
+  assert.equal(resolveMediaModel(config, ctx, "image"), image);
+  assert.equal(resolveMediaModel(config, ctx, "image", "gpt-image-2.5"), "gpt-image-2.5");
+  assert.throws(() => resolveMediaModel(config, ctx, "image", ""), /supported image model/);
+  for (const defaults of [
+    null,
+    [],
+    { image: null },
+    { image: 42 },
+    { image: "bad\nvalue" },
+    { image: video },
+    { image: "missing-image" },
+    { image: "imagen-4.0-generate-001" },
+    { image: "vertex/gpt-image-2.5" },
+  ]) {
+    save(defaults);
+    assert.equal(effectiveMediaDefaults(config, ctx).automatic, undefined);
+    assert.throws(() => resolveMediaModel(config, ctx, "image"), /No image default/);
+    assert.equal(resolveMediaModel(config, ctx, "image", "gpt-image-2.5-flare"), "gpt-image-2.5-flare");
+  }
+  save({}, 2);
+  assert.throws(() => resolveMediaModel(config, ctx, "image"), /No image default/);
+  sessionManager.branch(explicit);
+  assert.equal(resolveMediaModel(config, ctx, "image"), image);
+  assert.equal(
+    resolveMediaModel(parseConfig({ baseUrl: "https://other.example" }), ctx, "image"),
+    OPENAI_IMAGE_DEFAULT,
+  );
+  sessionManager.branch(empty);
+  assert.equal(resolveMediaModel(config, ctx, "image"), OPENAI_IMAGE_DEFAULT);
+  assert.deepEqual(effectiveMediaDefaults(config, { ...ctx, model: chat }).defaults, {});
+  const header = sessionManager.getHeader();
+  assert.ok(header);
+  const forked = SessionManager.inMemory(undefined, undefined, [
+    header,
+    ...sessionManager.getBranch(explicit),
+  ]);
+  assert.equal(resolveMediaModel(config, { ...ctx, sessionManager: forked }, "image"), image);
+});
+
+test("picker, listings and lifecycle status show derived defaults without generation or unrelated persistence", async (t) => {
+  const config = parseConfig({});
+  const sessionManager = SessionManager.inMemory();
+  const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+  const output: string[] = [];
+  let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+  let gets = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+    assert.equal(init?.method, undefined, "Selection must not generate");
+    gets++;
+    return Response.json({ data: [...catalog.data, { id: OPENAI_IMAGE_DEFAULT, owned_by: "openai" }] });
+  });
+  t.mock.method(console, "error", (text: string) => output.push(text));
+  const pi = {
+    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) {
+      hooks.set(event, handler);
+    },
+    registerCommand(_name, options) {
+      command = options;
+    },
+    appendEntry(type, data) {
+      sessionManager.appendCustomEntry(type, data);
+    },
+    sendMessage(message, options) {
+      assert.equal(options?.triggerTurn, false);
+      output.push(String(message.content));
+    },
+  } as ExtensionAPI;
+  const ctx = {
+    mode: "rpc",
+    hasUI: true,
+    model: { ...chat, provider: "openai-codex" },
+    sessionManager,
+    ui: {
+      notify: (text: string) => output.push(text),
+      setStatus: (_key: string, text: string) => output.push(text),
+      async custom(factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) {
+        const picker = await factory(
+          { terminal: { rows: 14 }, requestRender() {} } as never,
+          theme,
+          new KeybindingsManager(TUI_KEYBINDINGS) as never,
+          () => {},
+        );
+        const rendered = picker.render(200).join("\n");
+        assert.match(rendered, /gpt-image-2.5-sunburst.*automatic default/);
+        assert.match(rendered, /gpt-image-2.5-sunburst.*selected/);
+        return undefined;
+      },
+    },
+    modelRegistry: { getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }) },
+  } as unknown as ExtensionCommandContext;
+  registerModelPicker(pi, config);
+  assert.ok(command);
+  for (const hook of ["session_start", "session_tree"]) {
+    hooks.get(hook)?.({}, ctx);
+    assert.match(output.at(-1) ?? "", /gpt-image-2.5-sunburst.*automatic default/);
+  }
+  hooks.get("model_select")?.({ model: chat }, ctx);
+  assert.match(output.at(-1) ?? "", /Image: none/);
+  hooks.get("model_select")?.({ model: ctx.model }, { ...ctx, model: chat });
+  assert.match(output.at(-1) ?? "", /automatic default/);
+  assert.equal(gets, 0);
+  assert.deepEqual(sessionManager.getBranch(), []);
+  for (const mode of ["rpc", "json", "print"] as const) {
+    await command.handler("list", { ...ctx, mode, hasUI: mode === "rpc" });
+    assert.match(output.at(-1) ?? "", /gpt-image-2.5-sunburst.*automatic default/);
+  }
+  await command.handler("", { ...ctx, mode: "tui" });
+  await command.handler(`select ${video}`, ctx);
+  assert.deepEqual(readMediaDefaults(config, ctx), { video });
+  await command.handler("clear video", ctx);
+  assert.deepEqual(readMediaDefaults(config, ctx), {});
+  await command.handler(`select ${image}`, ctx);
+  assert.equal(effectiveMediaDefaults(config, ctx).automatic, undefined);
+  await command.handler("clear image", ctx);
+  assert.match(output.at(-1) ?? "", /automatic default/);
+  sessionManager.appendCustomEntry(MEDIA_DEFAULTS_ENTRY, {
+    version: 1,
+    endpoint: config.baseUrl,
+    defaults: { image: "invalid" },
+  });
+  await command.handler(`select ${video}`, ctx);
+  assert.deepEqual(readMediaDefaults(config, ctx), { image: null, video });
+  assert.throws(() => resolveMediaModel(config, ctx, "image"), /No image default/);
+  await command.handler("clear image", ctx);
+  assert.equal(resolveMediaModel(config, ctx, "image"), OPENAI_IMAGE_DEFAULT);
+  assert.deepEqual(effectiveMediaDefaults(config, { ...ctx, model: chat }).defaults, { video });
+  assert.equal(gets, 7);
 });

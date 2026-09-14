@@ -967,3 +967,32 @@ test("qualified Gemini adapters retain thinking, tool IDs, strict sampling, imag
     }
   }
 });
+
+test("previous-policy caches cannot restore GPT-image chat aliases", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("Offline restoration must not contact the proxy"));
+  for (const id of [
+    "gpt-image-1.5",
+    "gpt-image-2",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5",
+  ]) {
+    const config = parseConfig({ aliases: { [id]: "openai/gpt-fixture" } });
+    const provider = createCliproxyProvider(config, known);
+    await provider.refreshModels({
+      allowNetwork: false,
+      signal: AbortSignal.timeout(5000),
+      stored: {
+        etag: createHash("sha256")
+          .update(JSON.stringify([2, config]))
+          .digest("hex"),
+        models: [{ ...known[1], id, provider: PROVIDER_ID, headers: undefined }],
+      },
+      async publish(publication) {
+        publication.update?.();
+        return true;
+      },
+    });
+    assert.deepEqual(provider.getModels(), []);
+  }
+});

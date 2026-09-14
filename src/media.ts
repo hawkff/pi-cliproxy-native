@@ -1,10 +1,13 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { join } from "node:path";
+import { addAbortSignal, Readable } from "node:stream";
 import { type ImageContent, type Static, type TextContent, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mapMediaCatalog, mediaCapability } from "./catalog.ts";
 import { type Config, isRecord, PROVIDER_ID } from "./config.ts";
-import { type DefaultsContext, readMediaDefaults, resolveMediaModel } from "./media-defaults.ts";
+import { type DefaultsContext, effectiveMediaDefaults, resolveMediaModel } from "./media-defaults.ts";
 import { fetchCatalog, validateKey } from "./provider.ts";
 
 type MediaContext = Pick<ExtensionContext, "cwd" | "model"> &
@@ -18,7 +21,7 @@ const generationParameters = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact advertised ID, including any routing prefix, from cliproxyapi_media_models. Omit only after selecting a session default with /cli:model; explicit ID wins.",
+        "Exact advertised ID, including any routing prefix, from cliproxyapi_media_models. Omit to use the effective default (selected with /cli:model, or automatic for OpenAI/GPT images); explicit ID wins.",
     }),
   ),
   prompt: Type.String({ minLength: 1 }),
@@ -58,6 +61,53 @@ export async function mediaKey(ctx: Pick<MediaContext, "modelRegistry">, signal:
   }
 }
 
+function openaiImageResponse(config: Config, key: string, body: object, signal: AbortSignal) {
+  return new Promise<{ ok: boolean; status: number; body: ReturnType<typeof Readable.toWeb> | null }>(
+    (resolve, reject) => {
+      const url = new URL(`${config.baseUrl}/v1/images/generations`);
+      // A private agent and no socket timeout leave the overall signal in control of long image waits.
+      const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
+        url,
+        {
+          method: "POST",
+          agent: false,
+          timeout: 0,
+          signal,
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+            "Accept-Encoding": "identity",
+          },
+        },
+        (incoming) => {
+          const status = incoming.statusCode ?? 500;
+          if (status < 200 || status >= 300) {
+            incoming.destroy();
+            resolve({ ok: false, status, body: null });
+            return;
+          }
+          if (incoming.headers["content-encoding"] && incoming.headers["content-encoding"] !== "identity") {
+            incoming.destroy();
+            reject(new Error("Unsupported image response encoding."));
+            return;
+          }
+          resolve({
+            ok: true,
+            status,
+            body: Readable.toWeb(addAbortSignal(signal, incoming), { strategy: { highWaterMark: 1 } }),
+          });
+        },
+      );
+      request.on("error", reject);
+      request.on("upgrade", (incoming, socket) => {
+        socket.destroy();
+        resolve({ ok: false, status: incoming.statusCode ?? 101, body: null });
+      });
+      request.end(JSON.stringify(body));
+    },
+  );
+}
+
 async function mediaRequest(
   config: Config,
   key: string,
@@ -65,16 +115,20 @@ async function mediaRequest(
   signal: AbortSignal,
   maxBytes: number,
   body?: object,
+  openaiImage = false,
 ) {
-  let response: Response;
+  let response: Response | Awaited<ReturnType<typeof openaiImageResponse>>;
   try {
-    response = await fetch(`${config.baseUrl}/${path}`, {
-      method: body ? "POST" : "GET",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-      redirect: "error",
-      signal,
-    });
+    response =
+      openaiImage && body
+        ? await openaiImageResponse(config, key, body, signal)
+        : await fetch(`${config.baseUrl}/${path}`, {
+            method: body ? "POST" : "GET",
+            headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+            body: body ? JSON.stringify(body) : undefined,
+            redirect: "error",
+            signal,
+          });
   } catch {
     throw new Error(
       "CLIProxyAPI media request failed: connection, cancellation, timeout, or redirect error. Generation was not retried.",
@@ -244,25 +298,34 @@ export async function generateImage(
   params: Static<typeof generationParameters>,
   ctx: MediaContext,
   signal?: AbortSignal,
+  onProgress?: (text: string) => void,
 ) {
   const model = resolveMediaModel(config, ctx, "image", params.model);
-  const bounded = deadline(signal, 180000);
-  const key = await generationKey(config, { ...params, model }, ctx, bounded);
   const route = mediaCapability(model)?.route;
+  const bounded = deadline(signal, route === "openai" ? 600000 : 180000);
+  const key = await generationKey(config, { ...params, model }, ctx, bounded);
+  bounded.throwIfAborted();
+  onProgress?.("Generating image...");
+  bounded.throwIfAborted();
   const result = await mediaRequest(
     config,
     key,
-    route === "xai" ? "v1/images/generations" : `v1beta/models/${model}:generateContent`,
+    route === "gemini" ? `v1beta/models/${model}:generateContent` : "v1/images/generations",
     bounded,
     32 * 1024 * 1024,
     route === "xai"
       ? { model, prompt: params.prompt, n: 1, response_format: "b64_json" }
-      : {
-          contents: [{ role: "user", parts: [{ text: params.prompt }] }],
-          generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 },
-        },
+      : route === "openai"
+        ? { model, prompt: params.prompt, n: 1 }
+        : {
+            contents: [{ role: "user", parts: [{ text: params.prompt }] }],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 },
+          },
+    route === "openai",
   );
-  const images = route === "xai" ? [parseImage(result)] : parseGoogleImages(result);
+  const images = route === "gemini" ? parseGoogleImages(result) : [parseImage(result)];
+  bounded.throwIfAborted();
+  onProgress?.("Saving image...");
   bounded.throwIfAborted();
   const artifacts = join(ctx.cwd, ".pi");
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
@@ -375,10 +438,10 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const models = await listMediaModels(config, ctx, signal);
-      const defaults = readMediaDefaults(config, ctx);
+      const { defaults, automatic } = effectiveMediaDefaults(config, ctx);
       return {
-        content: [{ type: "text", text: JSON.stringify({ models, defaults }) }],
-        details: { models, defaults },
+        content: [{ type: "text", text: JSON.stringify({ models, defaults, automatic }) }],
+        details: { models, defaults, automatic },
       };
     },
   });
@@ -386,10 +449,16 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     name: "cliproxyapi_generate_image",
     label: "CLIProxyAPI image",
     description:
-      "Generate images using an explicit available image model or the session image default selected with /cli:model. Saves each final image under a new .pi/ artifact directory and returns paths and previews for vision-capable chat models. Maximum response: 32 MiB; inline image base64: 4 MiB. Larger images return paths without previews. No automatic retries.",
+      "Generate images using an explicit available image model, a selected session default, or gpt-image-2.5-sunburst automatically for OpenAI/GPT chats. Saves each final image under a new .pi/ artifact directory and returns paths and previews for vision-capable chat models. Maximum response: 32 MiB; inline image base64: 4 MiB. Larger images return paths without previews. No automatic retries.",
+    promptSnippet: "Generate requested raster images through CLIProxyAPI using the effective image default.",
+    promptGuidelines: [
+      "Use cliproxyapi_generate_image for requested raster images. Omit model to use the effective default unless a specific image model is requested; keep the current chat model.",
+    ],
     parameters: generationParameters,
-    async execute(_id, params, signal, _update, ctx) {
-      return generateImage(config, params, ctx, signal);
+    async execute(_id, params, signal, onUpdate, ctx) {
+      return generateImage(config, params, ctx, signal, (text) =>
+        onUpdate?.({ content: [{ type: "text", text }], details: {} }),
+      );
     },
   });
   pi.registerTool({

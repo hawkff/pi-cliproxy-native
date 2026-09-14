@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -41,16 +40,17 @@ const catalog = {
 };
 const theme = { fg: (_color: string, text: string) => text } as ExtensionContext["ui"]["theme"];
 
-test("picker catalog labels verified purposes, friendly names and owners without guessing unknowns", () => {
-  const rows = pickerCatalog(catalog, parseConfig({}));
-  assert.equal(rows.length, 4);
+test("picker catalog lists only verified image/video models without duplicate IDs or guessed capabilities", () => {
+  const rows = pickerCatalog({ data: [...catalog.data, catalog.data[0]] });
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    [image, video],
+  );
   assert.equal(rows[0].name, "Nano Banana 2 · Automatic (proxy routing)");
   assert.equal(rows[0].owner, "antigravity");
   assert.equal(rows[0].purpose, "image");
   assert.equal(rows[1].name, "Grok Imagine Video · Automatic (proxy routing)");
-  assert.equal(rows[2].purpose, "chat");
-  assert.equal(rows[3].purpose, "unknown / unsupported");
-  assert.equal(rows[3].supported, false);
+  assert.equal(rows[1].purpose, "video");
   const items = rows.map((row) => ({
     value: row.id,
     label: row.name,
@@ -62,7 +62,7 @@ test("picker catalog labels verified purposes, friendly names and owners without
       searchPickerItems(items, query).map((item) => item.value),
       [image],
     );
-  assert.equal(searchPickerItems(items, "team unsupported")[0].value, "unknown-image");
+  assert.deepEqual(searchPickerItems(items, "team unsupported"), []);
   assert.deepEqual(searchPickerItems(items, "veo"), []);
 });
 
@@ -76,14 +76,13 @@ test("retired Imagen rows remain visible with reasons but cannot be selected or 
   ].flatMap((id) => [id, `vertex/${id}`, `antigravity/${id}`]);
   const advertised = { data: [...catalog.data, ...ids.map((id) => ({ id, owned_by: "google" }))] };
   const config = parseConfig({});
-  const rows = pickerCatalog(advertised, config).filter((row) => ids.includes(row.id));
+  const rows = pickerCatalog(advertised).filter((row) => ids.includes(row.id));
   assert.equal(rows.length, ids.length);
   for (const row of rows) {
     assert.match(row.name, /^Imagen [34]/);
     assert.equal(row.purpose, "image");
     assert.equal(row.supported, false);
     assert.match(row.disabledReason ?? "", /Retired on Vertex.*Nano Banana/);
-    assert.equal(row.model, undefined);
   }
   let requests = 0;
   t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
@@ -220,10 +219,9 @@ test("ModelPicker handles search, injected keys, paging, unsupported selection, 
 });
 
 test("Nano Banana backend labels remain visible in narrow picker rows", () => {
-  const rows = pickerCatalog(
-    { data: [{ id: "vertex/gemini-2.5-flash-image" }, { id: "antigravity/gemini-3.1-flash-image" }] },
-    parseConfig({}),
-  );
+  const rows = pickerCatalog({
+    data: [{ id: "vertex/gemini-2.5-flash-image" }, { id: "antigravity/gemini-3.1-flash-image" }],
+  });
   assert.deepEqual(
     rows.map((row) => row.name),
     ["Nano Banana · Vertex", "Nano Banana 2 · Antigravity"],
@@ -349,35 +347,35 @@ test("defaults restore only current branch and endpoint, survive reload/fork and
   assert.deepEqual(readMediaDefaults(config, ctx), { image: null, video: null });
 });
 
-test("picker listing and selection do only GETs, chat uses setModel, and lifecycle restoration reads the branch", async (t) => {
+test("media selection uses only GETs, restores branch defaults, and never changes chat or the footer", async (t) => {
   let gets = 0;
   t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
     assert.equal(url, "http://localhost:8317/v1/models");
     assert.equal(init?.method, undefined);
     gets++;
-    return new Response(JSON.stringify(catalog));
+    return Response.json(catalog);
   });
   const config = parseConfig({});
   const sessionManager = SessionManager.inMemory();
   let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-  const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
-  const selected: Model<Api>[] = [];
+  let hooks = 0;
+  let chatCalls = 0;
+  let footerWrites = 0;
   const notifications: string[] = [];
   t.mock.method(console, "error", (text: string) => notifications.push(text));
-  const statuses: string[] = [];
   const pi = {
     registerCommand(name, options) {
       assert.equal(name, "cli:model");
       command = options;
     },
-    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) {
-      hooks.set(event, handler);
+    on(_event: string, _handler: (event: unknown, ctx: ExtensionContext) => void) {
+      hooks++;
     },
     appendEntry(type, data) {
       sessionManager.appendCustomEntry(type, data);
     },
-    async setModel(model) {
-      selected.push(model);
+    async setModel(_model) {
+      chatCalls++;
       return true;
     },
     sendMessage(message, options) {
@@ -385,136 +383,59 @@ test("picker listing and selection do only GETs, chat uses setModel, and lifecyc
       notifications.push(String(message.content));
     },
   } as ExtensionAPI;
-  const registryModel = {
-    ...pickerCatalog(catalog, config)[2].model,
-    name: "Registry override",
-    contextWindow: 42,
-  } as Model<Api>;
   const ctx = {
     mode: "rpc",
     hasUI: true,
     sessionManager,
     ui: {
       notify: (text: string) => notifications.push(text),
-      setStatus: (_key: string, text: string) => statuses.push(text),
+      setStatus() {
+        footerWrites++;
+      },
       custom: () => assert.fail("RPC must not open a TUI"),
     },
     modelRegistry: {
       getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }),
-      find: () => registryModel,
-      refresh: () => assert.fail("Existing registry models need no refresh"),
+      find() {
+        chatCalls++;
+        return chat;
+      },
+      async refresh() {
+        chatCalls++;
+        return { errors: new Map(), aborted: false };
+      },
     },
   } as unknown as ExtensionCommandContext;
   registerModelPicker(pi, config);
   assert.equal(gets, 0);
+  assert.equal(hooks, 0);
   assert.ok(command);
   await command.handler("", ctx);
   assert.match(notifications.at(-1) ?? "", /Nano Banana.*antigravity.*image/);
-  assert.match(notifications.at(-1) ?? "", /unknown \/ unsupported/);
-  assert.deepEqual(readMediaDefaults(config, ctx), {});
+  assert.ok(!notifications.at(-1)?.includes(chat.id));
+  assert.ok(!notifications.at(-1)?.includes("unknown-image"));
   await command.handler(`select ${image}`, ctx);
   const imageLeaf = sessionManager.getLeafId();
   assert.ok(imageLeaf);
   await command.handler(`select ${video}`, ctx);
   assert.deepEqual(readMediaDefaults(config, ctx), { image, video });
-  assert.equal(selected.length, 0);
-  await command.handler(`select ${chat.id}`, ctx);
-  assert.equal(selected[0], registryModel);
-  let published = false;
-  let refreshes = 0;
-  t.mock.method(ctx.modelRegistry, "find", () => (published ? registryModel : undefined));
-  t.mock.method(
-    ctx.modelRegistry,
-    "refresh",
-    async (options: { providers: string[]; force: boolean; signal: AbortSignal }) => {
-      assert.deepEqual(options.providers, ["cliproxyapi"]);
-      assert.equal(options.force, true);
-      assert.ok(options.signal instanceof AbortSignal);
-      refreshes++;
-      published = true;
-      return { errors: new Map(), aborted: false };
-    },
-  );
-  await command.handler(`select ${chat.id}`, ctx);
-  assert.equal(refreshes, 1);
-  assert.equal(selected[1], registryModel);
-  await command.handler("select unknown-image", ctx);
-  assert.match(notifications.at(-1) ?? "", /unsupported/);
-  assert.equal(selected.length, 2);
+  for (const id of [chat.id, "unknown-image"]) {
+    await command.handler(`select ${id}`, ctx);
+    assert.match(notifications.at(-1) ?? "", /unsupported/);
+    assert.deepEqual(readMediaDefaults(config, ctx), { image, video });
+  }
   await command.handler("clear image", ctx);
   assert.deepEqual(readMediaDefaults(config, ctx), { video });
   sessionManager.branch(imageLeaf);
-  hooks.get("session_tree")?.({}, ctx);
-  assert.match(statuses.at(-1) ?? "", /Video: none/);
-  hooks.get("session_start")?.({ reason: "reload" }, ctx);
-  assert.match(statuses.at(-1) ?? "", /Image: gemini-3.1-flash-image/);
+  await command.handler("list", ctx);
+  assert.match(notifications.at(-1) ?? "", /Image: gemini-3.1-flash-image.*Video: none/);
   for (const mode of ["print", "json"] as const) {
     await command.handler("search banana", { ...ctx, mode, hasUI: false });
     assert.match(notifications.at(-1) ?? "", /Nano Banana/);
   }
   assert.equal(gets, 8);
-});
-
-test("chat refresh gets a fresh deadline after browsing and retains caller cancellation", async (t) => {
-  const deadlines: { milliseconds: number; controller: AbortController }[] = [];
-  t.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
-    const controller = new AbortController();
-    deadlines.push({ milliseconds, controller });
-    return controller.signal;
-  });
-  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(catalog)));
-  for (const cancellation of ["none", "browsing", "refresh"] as const) {
-    const caller = new AbortController();
-    const selected: Model<Api>[] = [];
-    let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-    let refreshSignal: AbortSignal | undefined;
-    let discoveryDeadlineCount = 0;
-    let published = false;
-    const pi: Pick<ExtensionAPI, "on" | "registerCommand" | "setModel"> = {
-      on() {},
-      registerCommand(_name, options) {
-        command = options;
-      },
-      async setModel(model) {
-        selected.push(model);
-        return true;
-      },
-    };
-    const ctx = {
-      mode: "tui",
-      hasUI: true,
-      signal: caller.signal,
-      sessionManager: SessionManager.inMemory(),
-      ui: {
-        notify() {},
-        async custom() {
-          discoveryDeadlineCount = deadlines.length;
-          for (const deadline of deadlines) deadline.controller.abort();
-          if (cancellation === "browsing") caller.abort();
-          return chat.id;
-        },
-      },
-      modelRegistry: {
-        getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }),
-        find: () => (published ? chat : undefined),
-        async refresh(options: { signal: AbortSignal }) {
-          refreshSignal = options.signal;
-          if (cancellation === "refresh") caller.abort();
-          published = !options.signal.aborted;
-          return { errors: new Map(), aborted: options.signal.aborted };
-        },
-      },
-    } as unknown as ExtensionCommandContext;
-    registerModelPicker(pi as ExtensionAPI, parseConfig({}));
-    assert.ok(command);
-    await command.handler("", ctx);
-    assert.equal(deadlines.length, discoveryDeadlineCount + 1);
-    assert.equal(deadlines.at(-1)?.milliseconds, 15000);
-    assert.ok(refreshSignal);
-    assert.equal(refreshSignal.aborted, cancellation !== "none");
-    assert.equal(selected.length, cancellation === "none" ? 1 : 0);
-    if (cancellation === "none") assert.equal(selected[0], chat);
-  }
+  assert.equal(chatCalls, 0);
+  assert.equal(footerWrites, 0);
 });
 
 test("Pi loads and dispatches the colon command in RPC, print and JSON without inference or generation", async (t) => {
@@ -608,10 +529,10 @@ test("Pi loads and dispatches the colon command in RPC, print and JSON without i
     await call("clear", { type: "prompt", message: "/cli:model clear image" });
     assert.ok(notifications.some((text) => text.includes("Nano Banana")));
     assert.ok(notifications.some((text) => text.includes(`Image: none | Video: ${video}`)));
-    await call("chat", { type: "prompt", message: `/cli:model select ${chat.id}` });
+    await call("reject-chat", { type: "prompt", message: `/cli:model select ${chat.id}` });
     const chatState = await call("chat-state", { type: "get_state" });
-    assert.ok(JSON.stringify(chatState).includes(chat.id));
-    assert.match(JSON.stringify(chatState), /cliproxyapi/);
+    assert.match(JSON.stringify(chatState), /bootstrap/);
+    assert.ok(!JSON.stringify(chatState).includes(chat.id));
   } finally {
     rpc.kill();
     await closed;
@@ -648,31 +569,32 @@ test("Pi loads and dispatches the colon command in RPC, print and JSON without i
   assert.equal(requests.length, 7);
 });
 
-test("picker labels backend routes across every purpose, selects exact effective chat IDs and restores qualified defaults", async (t) => {
+test("media picker preserves distinct backend routes and rejects chat, unknown and missing selections", async (t) => {
   const config = parseConfig({});
-  const ids = [chat.id, image, video, "future-model"].flatMap((id) => [
-    id,
-    `vertex/${id}`,
-    `antigravity/${id}`,
-  ]);
-  let advertised = [...ids, `custom/${image}`];
+  const ids = [image, video].flatMap((id) => [id, `vertex/${id}`, `antigravity/${id}`]);
+  const excluded = [
+    chat.id,
+    `vertex/${chat.id}`,
+    `antigravity/${chat.id}`,
+    "future-model",
+    `custom/${image}`,
+  ];
+  let advertised = [...ids, ...excluded, ids[0]];
   t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
     assert.equal(init?.method, undefined);
-    return new Response(JSON.stringify({ data: advertised.map((id) => ({ id, owned_by: "google" })) }));
+    return Response.json({ data: advertised.map((id) => ({ id, owned_by: "google" })) });
   });
-  const rows = pickerCatalog({ data: advertised.map((id) => ({ id, owned_by: "google" })) }, config);
+  const rows = pickerCatalog({ data: advertised.map((id) => ({ id, owned_by: "google" })) });
   assert.deepEqual(
     rows.map((row) => row.id),
-    advertised,
+    ids,
   );
   for (const row of rows) {
     const backend = row.id.startsWith("vertex/")
       ? "Vertex"
       : row.id.startsWith("antigravity/")
         ? "Antigravity"
-        : row.id.startsWith("custom/")
-          ? "Unknown backend"
-          : "Automatic (proxy routing)";
+        : "Automatic (proxy routing)";
     assert.equal(row.backend, backend);
     assert.ok(row.name.endsWith(` · ${backend}`));
     assert.equal(row.owner, "google");
@@ -683,27 +605,13 @@ test("picker labels backend routes across every purpose, selects exact effective
   }
   const sessionManager = SessionManager.inMemory();
   const notifications: string[] = [];
-  const statuses: string[] = [];
-  const selected: Model<Api>[] = [];
-  const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
   let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
-  const registry = new Map(
-    rows.flatMap((row) => (row.model ? [[row.id, { ...row.model, contextWindow: 42 }] as const] : [])),
-  );
-  let refreshes = 0;
   const pi = {
-    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) {
-      hooks.set(event, handler);
-    },
     registerCommand(_name, options) {
       command = options;
     },
     appendEntry(type, data) {
       sessionManager.appendCustomEntry(type, data);
-    },
-    async setModel(model) {
-      selected.push(model);
-      return true;
     },
     sendMessage(message) {
       notifications.push(String(message.content));
@@ -713,63 +621,36 @@ test("picker labels backend routes across every purpose, selects exact effective
     mode: "rpc",
     hasUI: true,
     sessionManager,
-    ui: {
-      notify: (text: string) => notifications.push(text),
-      setStatus: (_key: string, text: string) => statuses.push(text),
-    },
-    modelRegistry: {
-      getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }),
-      find(provider: string, id: string) {
-        assert.equal(provider, "cliproxyapi");
-        return registry.get(id);
-      },
-      async refresh() {
-        refreshes++;
-        return { errors: new Map(), aborted: false };
-      },
-    },
+    ui: { notify: (text: string) => notifications.push(text) },
+    modelRegistry: { getProviderAuth: async () => ({ auth: { apiKey: "fixture" } }) },
   } as unknown as ExtensionCommandContext;
   t.mock.method(console, "error", (text: string) => notifications.push(text));
   registerModelPicker(pi, config);
   assert.ok(command);
   for (const mode of ["rpc", "print", "json"] as const) {
     await command.handler("list", { ...ctx, mode, hasUI: mode === "rpc" });
-    for (const label of [
-      "Vertex",
-      "Antigravity",
-      "Automatic (proxy routing)",
-      "Unknown backend",
-      "unknown / unsupported",
-    ])
+    for (const id of excluded) assert.ok(!notifications.at(-1)?.includes(id));
+    for (const label of ["Vertex", "Antigravity", "Automatic (proxy routing)"])
       assert.ok(notifications.at(-1)?.includes(label));
     await command.handler("search antigravity banana", { ...ctx, mode, hasUI: mode === "rpc" });
     assert.ok(notifications.at(-1)?.includes(`antigravity/${image}`));
     assert.ok(!notifications.at(-1)?.includes(`vertex/${image}`));
   }
-  for (const prefix of ["vertex", "antigravity"]) {
-    const id = `${prefix}/${chat.id}`;
-    await command.handler(`select ${id}`, ctx);
-    assert.equal(selected.at(-1), registry.get(id));
+  for (const prefix of ["antigravity", "vertex"]) {
+    await command.handler(`select ${prefix}/${image}`, ctx);
+    assert.deepEqual(readMediaDefaults(config, ctx), { image: `${prefix}/${image}` });
   }
-  await command.handler(`select vertex/${image}`, ctx);
-  assert.equal(selected.length, 2);
   const header = sessionManager.getHeader();
   assert.ok(header);
   const restored = SessionManager.inMemory(undefined, undefined, [header, ...sessionManager.getBranch()]);
   assert.deepEqual(readMediaDefaults(config, { sessionManager: restored }), { image: `vertex/${image}` });
-  for (const hook of ["session_start", "session_tree"]) {
-    hooks.get(hook)?.({}, { ...ctx, sessionManager: restored });
-    assert.ok(statuses.at(-1)?.includes(`vertex/${image} · Vertex`));
+  for (const id of excluded) {
+    await command.handler(`select ${id}`, ctx);
+    assert.match(notifications.at(-1) ?? "", /unsupported/);
   }
-  registry.delete(`vertex/${chat.id}`);
-  await command.handler(`select vertex/${chat.id}`, ctx);
-  assert.equal(refreshes, 1);
-  assert.equal(selected.length, 2);
-  advertised = advertised.filter((id) => id !== `vertex/${chat.id}` && id !== `antigravity/${image}`);
-  await command.handler(`select vertex/${chat.id}`, ctx);
+  advertised = advertised.filter((id) => id !== `antigravity/${image}`);
   await command.handler(`select antigravity/${image}`, ctx);
-  assert.equal(selected.length, 2);
-  assert.equal(refreshes, 1);
+  assert.match(notifications.at(-1) ?? "", /unsupported/);
   assert.deepEqual(readMediaDefaults(config, ctx), { image: `vertex/${image}` });
 });
 
@@ -871,10 +752,11 @@ test("effective defaults preserve invalid selection barriers, explicit precedenc
   assert.equal(resolveMediaModel(config, { ...ctx, sessionManager: forked }, "image"), image);
 });
 
-test("picker, listings and lifecycle status show derived defaults without generation or unrelated persistence", async (t) => {
+test("media picker and listings show derived defaults without footer output or unrelated persistence", async (t) => {
   const config = parseConfig({});
   const sessionManager = SessionManager.inMemory();
-  const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+  let hooks = 0;
+  let footerWrites = 0;
   const output: string[] = [];
   let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
   let gets = 0;
@@ -885,8 +767,8 @@ test("picker, listings and lifecycle status show derived defaults without genera
   });
   t.mock.method(console, "error", (text: string) => output.push(text));
   const pi = {
-    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) {
-      hooks.set(event, handler);
+    on(_event: string, _handler: (event: unknown, ctx: ExtensionContext) => void) {
+      hooks++;
     },
     registerCommand(_name, options) {
       command = options;
@@ -906,7 +788,9 @@ test("picker, listings and lifecycle status show derived defaults without genera
     sessionManager,
     ui: {
       notify: (text: string) => output.push(text),
-      setStatus: (_key: string, text: string) => output.push(text),
+      setStatus() {
+        footerWrites++;
+      },
       async custom(factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) {
         const picker = await factory(
           { terminal: { rows: 14 }, requestRender() {} } as never,
@@ -924,16 +808,14 @@ test("picker, listings and lifecycle status show derived defaults without genera
   } as unknown as ExtensionCommandContext;
   registerModelPicker(pi, config);
   assert.ok(command);
-  for (const hook of ["session_start", "session_tree"]) {
-    hooks.get(hook)?.({}, ctx);
-    assert.match(output.at(-1) ?? "", /gpt-image-2.5-sunburst.*automatic default/);
-  }
-  hooks.get("model_select")?.({ model: chat }, ctx);
-  assert.match(output.at(-1) ?? "", /Image: none/);
-  hooks.get("model_select")?.({ model: ctx.model }, { ...ctx, model: chat });
-  assert.match(output.at(-1) ?? "", /automatic default/);
+  assert.equal(hooks, 0);
+  assert.deepEqual(output, []);
   assert.equal(gets, 0);
   assert.deepEqual(sessionManager.getBranch(), []);
+  await command.handler("list", { ...ctx, model: chat });
+  assert.match(output.at(-1) ?? "", /Image: none/);
+  await command.handler("list", ctx);
+  assert.match(output.at(-1) ?? "", /gpt-image-2.5-sunburst.*automatic default/);
   for (const mode of ["rpc", "json", "print"] as const) {
     await command.handler("list", { ...ctx, mode, hasUI: mode === "rpc" });
     assert.match(output.at(-1) ?? "", /gpt-image-2.5-sunburst.*automatic default/);
@@ -958,5 +840,6 @@ test("picker, listings and lifecycle status show derived defaults without genera
   await command.handler("clear image", ctx);
   assert.equal(resolveMediaModel(config, ctx, "image"), OPENAI_IMAGE_DEFAULT);
   assert.deepEqual(effectiveMediaDefaults(config, { ...ctx, model: chat }).defaults, { video });
-  assert.equal(gets, 7);
+  assert.equal(gets, 9);
+  assert.equal(footerWrites, 0);
 });

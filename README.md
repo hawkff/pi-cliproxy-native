@@ -64,11 +64,11 @@ Discovery calls `/v1/models` with a ten-second deadline. Failed requests and mal
 
 Pi owns catalog persistence and cancellation. Cached entries are scoped to the connection, alias configuration, and mapping policy; credentials are excluded. An upgrade can invalidate saved entries; run `/cliproxyapi-refresh` before offline chat. A saved catalog does not guarantee current upstream access.
 
-## Model picker
+## Media picker
 
-Run `/cli:model` for a searchable live catalog of chat, image, and video models. Rows show friendly names, exact IDs, backends, upstream owners, and capabilities. Search by name (including `nano` or `banana`), ID, backend, owner, or purpose. Unknown models remain visible as unsupported and cannot run.
+Run `/cli:model` for a searchable live catalog of image and video models. Chat models belong in Pi's `/model` menu. Rows show friendly names, exact IDs, backends, upstream owners, and capabilities. Search by name (including `nano` or `banana`), ID, backend, owner, or purpose. The picker omits chat models and IDs without a known media capability.
 
-Selecting a chat model uses Pi's session model selection. Selecting an image or video model sets a separate session default; it does not change chat or generate anything. The picker and footer show the effective media defaults. OpenAI/GPT chats use `gpt-image-2.5-sunburst` automatically unless you select an image default. Clearing that selection restores automatic behavior.
+Selecting an image or video model sets a separate session default; it does not change chat or generate anything. The picker shows the effective media defaults. OpenAI/GPT chats use `gpt-image-2.5-sunburst` automatically unless you select an image default. Clearing that selection restores automatic behavior.
 
 ```text
 /cli:model search banana
@@ -82,13 +82,13 @@ The terminal picker is keyboard-only; mouse clicks and wheel events do not chang
 
 Pi stores media defaults in custom session entries, scoped to the configured proxy endpoint. Reload, resume, and tree navigation restore the current branch's defaults. Forks inherit selected defaults from their copied branch; new sessions start without explicit selections. Automatic image defaults follow the current chat model without network access or persistence. The extension keeps defaults separate for each endpoint and creates no global media settings or disk cache.
 
-Explicit picker and media calls contact the proxy, including in offline chat mode. The picker fetches `/v1/models` on demand. Selecting a chat ID missing from Pi's registry refreshes the native chat catalog first, then uses the effective registry model, including overrides. Listing and media selection do not refresh the chat cache. A post-selection chat refresh has its own 15-second deadline; time spent browsing does not count toward it.
+Explicit picker and media calls contact the proxy, including in offline chat mode. The picker fetches `/v1/models` on demand without refreshing Pi's chat catalog.
 
 ## Backend routing
 
 Set the top-level `prefix` field to `vertex` on Vertex auth records and `antigravity` on Antigravity auth records in CLIProxyAPI. Version 7.3.1 advertises these routes as `vertex/<canonical-id>` and `antigravity/<canonical-id>` through `/v1/models`. With `force-model-prefix: false`, it also retains bare IDs. The extension does not change proxy configuration or restart the proxy.
 
-The picker and chat registry keep each advertised route separate. For example, select `vertex/gemini-2.5-flash-image` for Nano Banana through Vertex or `antigravity/gemini-3.1-flash-image` for Nano Banana 2 through Antigravity. Backend labels apply to chat, image, video, and unknown rows. Bare IDs show **Automatic (proxy routing)**; `owned_by: google` identifies an owner, not a Vertex route. Custom prefixes show **Unknown backend**.
+The media picker and Pi's chat registry keep each advertised route separate. For example, select `vertex/gemini-2.5-flash-image` for Nano Banana through Vertex or `antigravity/gemini-3.1-flash-image` for Nano Banana 2 through Antigravity. Backend labels identify routes in both menus. Bare IDs show **Automatic (proxy routing)**; `owned_by: google` identifies an owner, not a Vertex route. Custom chat prefixes show **Unknown backend**.
 
 Keep the full ID in selections and media `model` arguments. The registry, defaults, requests, and results retain it. Prefix stripping serves metadata and Gemini adapter capability checks.
 
@@ -98,7 +98,7 @@ Exact `/cli:model select <ID>` and media calls, including stored media defaults,
 
 Discovery determines availability; Pi's built-in catalogs supply context limits, pricing, input types, and thinking capabilities. The extension matches bare IDs and the canonical part of `vertex/` and `antigravity/` IDs against Anthropic, OpenAI, Codex, and Google metadata. Recognized catalog ownership resolves duplicate metadata IDs, not backend routing; ambiguous cross-family matches are skipped.
 
-The chat catalog skips unknown IDs without guessing capabilities. `/cli:model` shows them as unsupported. To describe a proxy alias, add its canonical reference to `pi-cliproxyapi.json`:
+The chat catalog skips unknown IDs without guessing capabilities. To describe a proxy chat alias, add its canonical reference to `pi-cliproxyapi.json`:
 
 ```json
 {

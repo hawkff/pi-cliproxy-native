@@ -1,4 +1,3 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -8,8 +7,8 @@ import {
   type TuiMouseEvent,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import { backendLabel, mapCatalog, mediaCapability, parseCatalog, routedName } from "./catalog.ts";
-import { type Config, PROVIDER_ID } from "./config.ts";
+import { backendLabel, mediaCapability, parseCatalog, routedName } from "./catalog.ts";
+import type { Config } from "./config.ts";
 import { mediaKey } from "./media.ts";
 import {
   effectiveMediaDefaults,
@@ -17,14 +16,9 @@ import {
   type MediaDefaults,
   readMediaDefaults,
 } from "./media-defaults.ts";
-import { builtinCatalog, fetchCatalog } from "./provider.ts";
+import { fetchCatalog } from "./provider.ts";
 
-export function pickerCatalog(
-  value: unknown,
-  config: Config,
-  known: readonly Model<Api>[] = builtinCatalog(),
-) {
-  const chat = new Map(mapCatalog(value, config, known).models.map((model) => [model.id, model]));
+export function pickerCatalog(value: unknown) {
   const rows = new Map<
     string,
     {
@@ -32,8 +26,7 @@ export function pickerCatalog(
       name: string;
       owner: string;
       backend: string;
-      purpose: string;
-      model?: Model<Api>;
+      purpose: "image" | "video";
       supported: boolean;
       disabledReason?: string;
     }
@@ -41,16 +34,15 @@ export function pickerCatalog(
   for (const entry of parseCatalog(value)) {
     if (entry.hidden || rows.has(entry.id)) continue;
     const media = mediaCapability(entry.id);
-    const model = chat.get(entry.id);
+    if (!media) continue;
     rows.set(entry.id, {
       id: entry.id,
-      name: model?.name ?? routedName(entry.id, media?.name),
+      name: routedName(entry.id, media.name),
       owner: entry.owner ?? "unknown owner",
       backend: backendLabel(entry.id),
-      purpose: media?.purpose ?? (model ? "chat" : "unknown / unsupported"),
-      model,
-      supported: !!(media || model) && !media?.disabledReason,
-      disabledReason: media?.disabledReason,
+      purpose: media.purpose,
+      supported: !media.disabledReason,
+      disabledReason: media.disabledReason,
     });
   }
   return [...rows.values()];
@@ -71,12 +63,12 @@ function defaultsLabel(defaults: MediaDefaults, automatic?: string) {
   return `Image: ${label(defaults.image)}${automatic ? " (automatic default)" : ""} | Video: ${label(defaults.video)}`;
 }
 
-function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string) {
+function pickerItems(rows: PickerRow[], defaults: MediaDefaults) {
   return [
     ...rows.map((row) => ({
       value: row.id,
       label: `${row.name} (${row.id})`,
-      description: `${row.owner} | ${row.purpose}${row.disabledReason ? ` | ${row.disabledReason}` : ""}${defaults.image === row.id || defaults.video === row.id || chatId === row.id ? " | selected" : ""}`,
+      description: `${row.owner} | ${row.purpose}${row.disabledReason ? ` | ${row.disabledReason}` : ""}${defaults.image === row.id || defaults.video === row.id ? " | selected" : ""}`,
       supported: row.supported,
     })),
     ...(["image", "video"] as const).map((purpose) => ({
@@ -91,7 +83,7 @@ function pickerItems(rows: PickerRow[], defaults: MediaDefaults, chatId?: string
 export class ModelPicker extends Container implements Focusable {
   private input = new Input({
     prompt: "Search: ",
-    placeholder: "name, ID, backend, owner, chat/image/video",
+    placeholder: "name, ID, backend, owner, image/video",
   });
   private items: PickerItem[];
   private selected = 0;
@@ -202,7 +194,7 @@ export class ModelPicker extends Container implements Focusable {
     const item = this.items[this.selected];
     const hint = `${this.kb.getKeys("tui.select.confirm").join("/")} select | ${this.kb.getKeys("tui.select.cancel").join("/")} cancel`;
     return [
-      this.theme.fg("accent", "CLIProxyAPI models (keyboard only; selection does not generate)"),
+      this.theme.fg("accent", "CLIProxyAPI images and videos (keyboard only; selection does not generate)"),
       this.summary,
       ...super.render(Math.max(4, width)),
       item ? `ID: ${item.value}` : "No matching models",
@@ -215,16 +207,8 @@ export class ModelPicker extends Container implements Focusable {
 }
 
 export function registerModelPicker(pi: ExtensionAPI, config: Config) {
-  const status = (ctx: ExtensionContext) => {
-    const { defaults, automatic } = effectiveMediaDefaults(config, ctx);
-    if (ctx.hasUI) ctx.ui.setStatus("cliproxyapi-media", defaultsLabel(defaults, automatic));
-  };
-  pi.on("session_start", (_event, ctx) => status(ctx));
-  pi.on("session_tree", (_event, ctx) => status(ctx));
-  pi.on("model_select", (event, ctx) => status({ ...ctx, model: event.model }));
-
   pi.registerCommand("cli:model", {
-    description: "Search CLIProxyAPI chat/image/video models; select a chat model or session media default",
+    description: "Search CLIProxyAPI image/video models and select a session media default",
     getArgumentCompletions: (prefix) =>
       ["list", "search ", "select ", "clear image", "clear video"]
         .filter((value) => value.startsWith(prefix))
@@ -253,7 +237,6 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
             defaults[capability.purpose] = choice;
           }
           pi.appendEntry(MEDIA_DEFAULTS_ENTRY, { version: 1, endpoint: config.baseUrl, defaults });
-          status(ctx);
           const effective = effectiveMediaDefaults(config, ctx);
           report(defaultsLabel(effective.defaults, effective.automatic));
         };
@@ -271,13 +254,9 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
         }
         const signal = AbortSignal.any([...(ctx.signal ? [ctx.signal] : []), AbortSignal.timeout(15000)]);
         const key = await mediaKey(ctx, signal);
-        const rows = pickerCatalog(await fetchCatalog(config, key, signal), config);
+        const rows = pickerCatalog(await fetchCatalog(config, key, signal));
         const { defaults, automatic } = effectiveMediaDefaults(config, ctx);
-        const items = pickerItems(
-          rows,
-          defaults,
-          ctx.model?.provider === PROVIDER_ID ? ctx.model.id : undefined,
-        );
+        const items = pickerItems(rows, defaults);
         const explicit = input.startsWith("select ") ? input.slice(7).trim() : undefined;
         const query = input === "list" ? "" : input.startsWith("search ") ? input.slice(7) : input;
         let choice = explicit;
@@ -319,22 +298,7 @@ export function registerModelPicker(pi: ExtensionAPI, config: Config) {
         const row = rows.find((row) => row.id === choice);
         if (!row?.supported)
           throw new Error("Model unavailable or unsupported. Use /cli:model to list supported IDs.");
-        if (row.model) {
-          let model = ctx.modelRegistry.find(PROVIDER_ID, row.id);
-          if (!model) {
-            const refreshed = await ctx.modelRegistry.refresh({
-              providers: [PROVIDER_ID],
-              force: true,
-              signal: AbortSignal.any([...(ctx.signal ? [ctx.signal] : []), AbortSignal.timeout(15000)]),
-            });
-            if (refreshed.aborted || refreshed.errors.has(PROVIDER_ID))
-              throw new Error("CLIProxyAPI chat refresh failed.");
-            model = ctx.modelRegistry.find(PROVIDER_ID, row.id);
-          }
-          if (!model || !(await pi.setModel(model)))
-            throw new Error("CLIProxyAPI chat selection failed. Check /login cliproxyapi.");
-          report(`Chat: ${row.name} (${row.id})`);
-        } else save(row.id);
+        save(row.id);
       } catch {
         report(
           "CLIProxyAPI model selection failed: unavailable/unsupported model, invalid command, authentication, or connection error. Check /login cliproxyapi. Use /cli:model list, select <exact ID>, or clear image|video.",

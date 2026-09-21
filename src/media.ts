@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { addAbortSignal, Readable } from "node:stream";
 import { type ImageContent, type Static, type TextContent, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mapMediaCatalog, mediaCapability } from "./catalog.ts";
+import { mapMediaCatalog, mediaCapability, mediaControls } from "./catalog.ts";
 import { type Config, isRecord, PROVIDER_ID } from "./config.ts";
 import { type DefaultsContext, effectiveMediaDefaults, resolveMediaModel } from "./media-defaults.ts";
 import { fetchCatalog, validateKey } from "./provider.ts";
@@ -27,12 +27,80 @@ const generationParameters = Type.Object({
   prompt: Type.String({ minLength: 1 }),
 });
 
+const outputParameters = {
+  resolution: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 8,
+      description:
+        "Model-specific resolution tier, with exact spelling from cliproxyapi_media_models controls.resolution. Omit to preserve the backend default. OpenAI images use size instead.",
+    }),
+  ),
+  aspect_ratio: Type.Optional(
+    Type.String({
+      minLength: 3,
+      maxLength: 8,
+      description:
+        "Output aspect ratio from cliproxyapi_media_models controls.aspect_ratio, such as 16:9. OpenAI images encode this in size instead. Omit to preserve the backend default.",
+    }),
+  ),
+};
+
+const imageParameters = Type.Object({
+  ...generationParameters.properties,
+  ...outputParameters,
+  size: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 32,
+      description:
+        "OpenAI image size: auto or WIDTHxHEIGHT. Use controls.size and controls.size_limits from cliproxyapi_media_models. Omit to preserve the backend default.",
+    }),
+  ),
+});
+
 const videoParameters = Type.Object({
   ...generationParameters.properties,
+  ...outputParameters,
   duration: Type.Optional(
     Type.Integer({ minimum: 1, maximum: 15, description: "Video length in seconds (1–15)." }),
   ),
 });
+
+function mediaOutputOptions(
+  model: string,
+  params: Pick<Static<typeof imageParameters>, "size" | "resolution" | "aspect_ratio">,
+) {
+  const options = { size: params.size, resolution: params.resolution, aspect_ratio: params.aspect_ratio };
+  const controls = mediaControls(model);
+  for (const field of ["size", "resolution", "aspect_ratio"] as const) {
+    const value = options[field];
+    if (value === undefined) continue;
+    if (typeof value === "string" && controls[field].includes(value)) continue;
+    const limits = field === "size" ? controls.size_limits : undefined;
+    if (typeof value === "string" && limits) {
+      const match = /^([1-9]\d{0,3})x([1-9]\d{0,3})$/.exec(value);
+      if (match && match[0] === value) {
+        const width = Number(match[1]);
+        const height = Number(match[2]);
+        const pixels = width * height;
+        if (
+          width % limits.multiple_of === 0 &&
+          height % limits.multiple_of === 0 &&
+          Math.max(width, height) <= limits.max_edge &&
+          Math.max(width, height) / Math.min(width, height) <= limits.max_aspect_ratio &&
+          pixels >= limits.min_pixels &&
+          pixels <= limits.max_pixels
+        )
+          continue;
+      }
+    }
+    throw new Error(
+      `CLIProxyAPI ${field} is unsupported for ${model}. See cliproxyapi_media_models for supported controls.`,
+    );
+  }
+  return options;
+}
 
 function deadline(signal: AbortSignal | undefined, milliseconds: number) {
   return AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(milliseconds)]);
@@ -295,13 +363,14 @@ function parseGoogleImages(value: unknown) {
 
 export async function generateImage(
   config: Config,
-  params: Static<typeof generationParameters>,
+  params: Static<typeof imageParameters>,
   ctx: MediaContext,
   signal?: AbortSignal,
   onProgress?: (text: string) => void,
 ) {
   const model = resolveMediaModel(config, ctx, "image", params.model);
   const route = mediaCapability(model)?.route;
+  const output = mediaOutputOptions(model, params);
   const bounded = deadline(signal, route === "openai" ? 600000 : 180000);
   const key = await generationKey(config, { ...params, model }, ctx, bounded);
   bounded.throwIfAborted();
@@ -314,12 +383,25 @@ export async function generateImage(
     bounded,
     32 * 1024 * 1024,
     route === "xai"
-      ? { model, prompt: params.prompt, n: 1, response_format: "b64_json" }
+      ? {
+          model,
+          prompt: params.prompt,
+          n: 1,
+          response_format: "b64_json",
+          resolution: output.resolution,
+          aspect_ratio: output.aspect_ratio,
+        }
       : route === "openai"
-        ? { model, prompt: params.prompt, n: 1 }
+        ? { model, prompt: params.prompt, n: 1, size: output.size }
         : {
             contents: [{ role: "user", parts: [{ text: params.prompt }] }],
-            generationConfig: { responseModalities: ["TEXT", "IMAGE"], candidateCount: 1 },
+            generationConfig: {
+              responseModalities: ["TEXT", "IMAGE"],
+              candidateCount: 1,
+              ...(output.resolution !== undefined || output.aspect_ratio !== undefined
+                ? { imageConfig: { imageSize: output.resolution, aspectRatio: output.aspect_ratio } }
+                : {}),
+            },
           },
     route === "openai",
   );
@@ -385,12 +467,15 @@ export async function generateVideo(
     throw new Error("CLIProxyAPI video duration must be an integer from 1 to 15 seconds.");
   }
   const model = resolveMediaModel(config, ctx, "video", params.model);
+  const output = mediaOutputOptions(model, params);
   const bounded = deadline(signal, 60000);
   const key = await generationKey(config, { ...params, model }, ctx, bounded);
   const result = await mediaRequest(config, key, "v1/videos", bounded, 64 * 1024, {
     model,
     prompt: params.prompt,
     duration: params.duration,
+    resolution: output.resolution,
+    aspect_ratio: output.aspect_ratio,
   });
   if (!isRecord(result)) throw new Error("CLIProxyAPI returned an invalid video submission.");
   return { model, request_id: requestId(result.request_id), status: "pending" };
@@ -434,7 +519,7 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     name: "cliproxyapi_media_models",
     label: "CLIProxyAPI media models",
     description:
-      "List supported image and video models available through CLIProxyAPI. Does not change the chat model.",
+      "List available CLIProxyAPI image/video models, their supported output controls, and effective defaults. Does not change the chat model.",
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const models = await listMediaModels(config, ctx, signal);
@@ -454,7 +539,7 @@ export function registerMediaTools(pi: ExtensionAPI, config: Config) {
     promptGuidelines: [
       "Use cliproxyapi_generate_image for requested raster images. Omit model to use the effective default unless a specific image model is requested; keep the current chat model.",
     ],
-    parameters: generationParameters,
+    parameters: imageParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
       return generateImage(config, params, ctx, signal, (text) =>
         onUpdate?.({ content: [{ type: "text", text }], details: {} }),

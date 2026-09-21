@@ -107,8 +107,46 @@ export function mediaPurpose(id: string) {
   return mediaCapability(id)?.purpose;
 }
 
+export function mediaControls(id: string) {
+  const capability = mediaCapability(id);
+  const { metadataId } = modelRoute(id);
+  const commonRatios = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
+  let resolution: string[] = [];
+  let aspect_ratio: string[] = [];
+  if (capability?.route === "gemini") {
+    aspect_ratio = [...commonRatios, "4:5", "5:4", "21:9"];
+    if (metadataId === "gemini-3.1-flash-image") {
+      resolution = ["512", "1K", "2K", "4K"];
+      aspect_ratio.push("1:4", "4:1", "1:8", "8:1");
+    } else if (metadataId === "gemini-3-pro-image") resolution = ["1K", "2K", "4K"];
+    else if (metadataId === "gemini-3.1-flash-lite-image") resolution = ["1K"];
+  } else if (capability?.route === "xai") {
+    aspect_ratio = commonRatios;
+    if (capability.purpose === "image") {
+      resolution = ["1k", "2k"];
+      // CLIProxyAPI 7.3.11 drops other xAI image ratios, including auto.
+      aspect_ratio.push("9:20", "20:9");
+    } else {
+      resolution = ["480p", "720p"];
+      if (metadataId !== "grok-imagine-video") resolution.push("1080p");
+    }
+  }
+  return {
+    size: capability?.route === "openai" ? ["auto", "1024x1024", "1536x1024", "1024x1536"] : [],
+    size_limits:
+      capability?.route === "openai" && metadataId !== "gpt-image-1.5"
+        ? { multiple_of: 16, max_edge: 3840, min_pixels: 655360, max_pixels: 8294400, max_aspect_ratio: 3 }
+        : undefined,
+    resolution,
+    aspect_ratio,
+  };
+}
+
 export function mapMediaCatalog(value: unknown) {
-  const models = new Map<string, { id: string; purpose: MediaPurpose; name: string }>();
+  const models = new Map<
+    string,
+    { id: string; purpose: MediaPurpose; name: string; controls: ReturnType<typeof mediaControls> }
+  >();
   for (const entry of parseCatalog(value)) {
     const capability = mediaCapability(entry.id);
     if (!entry.hidden && capability && !capability.disabledReason)
@@ -116,6 +154,7 @@ export function mapMediaCatalog(value: unknown) {
         id: entry.id,
         purpose: capability.purpose,
         name: routedName(entry.id, capability.name),
+        controls: mediaControls(entry.id),
       });
   }
   return [...models.values()];

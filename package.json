@@ -1,8 +1,10 @@
 {
-  "name": "pi-cliproxyapi",
+  "name": "pi-cliproxy-native",
   "version": "0.1.0",
-  "private": true,
-  "description": "CLIProxyAPI model discovery using Pi's native API adapters",
+  "description": "CLIProxyAPI chat discovery and image/video generation with Pi's native adapters",
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -13,7 +15,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hawkff/pi-cliproxyapi.git"
+    "url": "git+https://github.com/hawkff/pi-cliproxy-native.git"
   },
   "files": [
     "extensions",
@@ -35,15 +37,15 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.13",
-    "@earendil-works/pi-ai": "^0.85.1",
-    "@earendil-works/pi-coding-agent": "^0.85.1",
-    "@earendil-works/pi-tui": "^0.85.1",
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@earendil-works/pi-tui": "^0.87.0",
     "@types/node": "^24.13.4",
     "typescript": "5.9.3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.85.1",
-    "@earendil-works/pi-coding-agent": "^0.85.1",
-    "@earendil-works/pi-tui": "^0.85.1"
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@earendil-works/pi-tui": "^0.87.0"
   }
 }

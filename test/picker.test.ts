@@ -93,7 +93,9 @@ test("retired Imagen rows remain visible with reasons but cannot be selected or 
   let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
   const notifications: string[] = [];
   const pi: Pick<ExtensionAPI, "on" | "registerCommand" | "appendEntry" | "setModel"> = {
-    on() {},
+    on() {
+      return () => {};
+    },
     registerCommand(_name, options) {
       command = options;
     },

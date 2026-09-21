@@ -9,10 +9,10 @@ Chat uses Pi's native API adapters and model metadata, with availability from yo
 You need Pi 0.87.x and Node.js 22.19 or newer. Run CLIProxyAPI with your upstream accounts configured before connecting Pi. This release targets CLIProxyAPI 7.3.11. The extension adds no runtime dependencies and needs no compilation.
 
 ```sh
-pi install git:github.com/hawkff/pi-cliproxy-native@v0.1.0
+pi install npm:pi-cliproxy-native@0.1.1
 ```
 
-For a local checkout, use `pi install /path/to/pi-cliproxy-native`.
+For Git installation, use `pi install git:github.com/hawkff/pi-cliproxy-native@v0.1.1`. For a local checkout, use `pi install /path/to/pi-cliproxy-native`.
 
 The default proxy address is `http://localhost:8317`. For another address, set the [connection](#connection) before logging in. Restart Pi, then run:
 
@@ -96,8 +96,6 @@ Pi saves image and video selections per session branch and proxy endpoint. Reloa
 Invalid or disabled saved selections block automatic fallback until you clear or replace them. Generation checks the live catalog before submitting and rejects missing or hidden IDs without choosing a replacement. Picker and media requests contact the proxy even in offline chat mode. They do not refresh Pi's chat catalog.
 
 ### Resolution and aspect ratio
-
-For these unreleased controls, install `main` with `pi install git:github.com/hawkff/pi-cliproxy-native`.
 
 Pass output controls for each generation, or omit them to keep the backend defaults. `cliproxyapi_media_models` lists each model's `controls.size`, `controls.resolution`, and `controls.aspect_ratio`. Empty lists mean the control is unsupported; `size_limits` describes custom pixel sizes beyond the listed presets.
 

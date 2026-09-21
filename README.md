@@ -82,9 +82,9 @@ Check video status for request_id <returned-id>.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `cliproxyapi_media_models` | None | Available supported image/video IDs and effective defaults. |
-| `cliproxyapi_generate_image` | `prompt`, optional `model` | Saved images and paths, plus previews when the chat model supports images. |
-| `cliproxyapi_generate_video` | `prompt`, optional `model`, optional integer `duration` from 1 to 15 seconds | A `request_id` for the submitted video. |
+| `cliproxyapi_media_models` | None | Available image/video IDs, supported output controls, and effective defaults. |
+| `cliproxyapi_generate_image` | `prompt`; optional `model`, `size`, `resolution`, `aspect_ratio` | Saved images and paths, plus previews when the chat model supports images. |
+| `cliproxyapi_generate_video` | `prompt`; optional `model`, `resolution`, `aspect_ratio`, and integer `duration` from 1 to 15 seconds | A `request_id` for the submitted video. |
 | `cliproxyapi_video_status` | `request_id` | One status check: pending, completed with a URL, or failed. |
 
 Pass `model` to choose an exact ID for one tool call. Otherwise, the tool uses its saved `/cli:model` selection. Without either, eligible OpenAI/GPT chats default to `gpt-image-2.5-sunburst` for images. Other chats need an image selection or explicit ID. Videos need a selection or explicit ID.
@@ -94,6 +94,35 @@ The automatic image default applies to native OpenAI/Codex chats, recognized GPT
 Pi saves image and video selections per session branch and proxy endpoint. Reload, resume, and tree navigation restore them; forks inherit them from the copied branch. New sessions have no saved selections. Clearing an image selection restores the automatic default where it applies.
 
 Invalid or disabled saved selections block automatic fallback until you clear or replace them. Generation checks the live catalog before submitting and rejects missing or hidden IDs without choosing a replacement. Picker and media requests contact the proxy even in offline chat mode. They do not refresh Pi's chat catalog.
+
+### Resolution and aspect ratio
+
+For these unreleased controls, install `main` with `pi install git:github.com/hawkff/pi-cliproxy-native`.
+
+Pass output controls for each generation, or omit them to keep the backend defaults. `cliproxyapi_media_models` lists each model's `controls.size`, `controls.resolution`, and `controls.aspect_ratio`. Empty lists mean the control is unsupported; `size_limits` describes custom pixel sizes beyond the listed presets.
+
+| Models | Controls |
+| --- | --- |
+| OpenAI images | `size`: `auto` or `WIDTHxHEIGHT`. No separate `resolution` or `aspect_ratio`. |
+| Gemini images | `aspect_ratio` and model-specific `resolution` tiers. |
+| xAI images | `resolution`: `1k` or `2k`, plus `aspect_ratio`. |
+| xAI videos | `resolution`: `480p` or `720p`, plus `aspect_ratio`. The 1.5 model and its preview alias also accept `1080p`. |
+
+GPT Image 1.5 accepts `auto`, `1024x1024`, `1536x1024`, and `1024x1536`. GPT Image 2 and 2.5 also accept custom dimensions: both edges must be multiples of 16 and at most 3840 pixels. The longer edge cannot exceed three times the shorter one. Total pixels must be between 655,360 and 8,294,400. OpenAI marks resolutions above `2560x1440` as experimental.
+
+Gemini 3 Pro Image supports `1K`, `2K`, and `4K`. Gemini 3.1 Flash Image also supports `512`. Flash Lite Image supports `1K` only. Gemini 2.5 Flash Image has no resolution selector. Use the exact case shown in discovery, including uppercase `K` for Gemini and lowercase `k` for xAI.
+
+Aspect ratios vary by model and proxy route. For example, CLIProxyAPI 7.3.11 accepts `20:9` for xAI images but drops xAI's `21:9` and `auto` values. The extension rejects unsupported controls before authentication or network access instead of substituting another size or shape.
+
+```text
+Generate an image with gpt-image-2.5-sunburst at size 2048x2048.
+Generate a 2K image at 16:9 with gemini-3-pro-image.
+Generate a 1-second 1080p video at 9:16 with grok-imagine-video-1.5.
+```
+
+Larger outputs can increase generation cost and latency. The extension saves the returned image bytes without resizing, and the existing response and preview limits still apply.
+
+Control values follow the [OpenAI image guide](https://developers.openai.com/api/docs/guides/image-generation#customize-image-output), [Gemini image guide](https://ai.google.dev/gemini-api/docs/generate-content/image-generation#aspect_ratios_and_image_size), and xAI's [image](https://docs.x.ai/developers/model-capabilities/images/generation#configuration) and [video](https://docs.x.ai/developers/model-capabilities/video/generation#configuration) documentation, restricted to what CLIProxyAPI forwards.
 
 ### Supported media models
 

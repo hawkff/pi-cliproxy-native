@@ -10,7 +10,7 @@ import { type TestContext, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
-import { mapCatalog, mapMediaCatalog, mediaCapability, routedName } from "../src/catalog.ts";
+import { mapCatalog, mapMediaCatalog, mediaCapability, mediaControls, routedName } from "../src/catalog.ts";
 import { PROVIDER_ID, parseConfig } from "../src/config.ts";
 import {
   generateImage,
@@ -93,6 +93,7 @@ test("media catalog maps six exact IDs, excludes hidden and unknown IDs, and can
       id,
       purpose: index < 3 ? "image" : "video",
       name: routedName(id, mediaCapability(id)?.name),
+      controls: mediaControls(id),
     })),
   );
   assert.deepEqual(
@@ -106,7 +107,14 @@ test("media catalog maps six exact IDs, excludes hidden and unknown IDs, and can
         ...["xai", "x-ai", "grok", "team"].map((prefix) => ({ id: `${prefix}/${imageModel}` })),
       ],
     }),
-    [{ id: videoModel, purpose: "video", name: routedName(videoModel, mediaCapability(videoModel)?.name) }],
+    [
+      {
+        id: videoModel,
+        purpose: "video",
+        name: routedName(videoModel, mediaCapability(videoModel)?.name),
+        controls: mediaControls(videoModel),
+      },
+    ],
   );
   const known = builtinCatalog();
   const chat = known[0];
@@ -527,6 +535,7 @@ const expectedGoogleModels = qualifiedGoogleIds.map((id) => ({
   id,
   purpose: "image",
   name: routedName(id, mediaCapability(id)?.name),
+  controls: mediaControls(id),
 }));
 const inline = (data = png, mimeType = "image/png") => ({ inlineData: { data, mimeType } });
 const googleResponse = (parts: unknown[] = [inline()]) => ({
@@ -1276,6 +1285,212 @@ test("OpenAI native transport completes delayed headers and bodies beyond fetch'
       );
     });
   }
+});
+
+test("media discovery reports model-specific output controls and preserves qualified routes", () => {
+  const models = mapMediaCatalog({
+    data: [...openaiIds, ...ids, ...qualifiedGoogleIds].map((id) => ({ id })),
+  });
+  const controls = (id: string) => {
+    const model = models.find((model) => model.id === id);
+    assert.ok(model);
+    return model.controls;
+  };
+  assert.deepEqual(controls("gpt-image-1.5").size, ["auto", "1024x1024", "1536x1024", "1024x1536"]);
+  assert.equal(controls("gpt-image-1.5").size_limits, undefined);
+  assert.deepEqual(controls("gpt-image-2.5-sunburst").size_limits, {
+    multiple_of: 16,
+    max_edge: 3840,
+    min_pixels: 655360,
+    max_pixels: 8294400,
+    max_aspect_ratio: 3,
+  });
+  assert.deepEqual(controls("gemini-2.5-flash-image").resolution, []);
+  assert.deepEqual(controls("gemini-3-pro-image").resolution, ["1K", "2K", "4K"]);
+  assert.deepEqual(controls("gemini-3.1-flash-image").resolution, ["512", "1K", "2K", "4K"]);
+  assert.deepEqual(controls("gemini-3.1-flash-lite-image").resolution, ["1K"]);
+  assert.ok(controls("gemini-3.1-flash-image").aspect_ratio.includes("8:1"));
+  assert.ok(!controls("gemini-3.1-flash-lite-image").aspect_ratio.includes("8:1"));
+  for (const id of googleIds) {
+    assert.deepEqual(controls(`vertex/${id}`), controls(id));
+    assert.deepEqual(controls(`antigravity/${id}`), controls(id));
+  }
+  assert.deepEqual(controls(imageModel).resolution, ["1k", "2k"]);
+  assert.ok(controls(imageModel).aspect_ratio.includes("20:9"));
+  for (const ratio of ["auto", "21:9", "2:1", "19.5:9"])
+    assert.ok(!controls(imageModel).aspect_ratio.includes(ratio));
+  assert.deepEqual(controls("grok-imagine-video").resolution, ["480p", "720p"]);
+  assert.deepEqual(controls(videoModel).resolution, ["480p", "720p", "1080p"]);
+  for (const id of ["unknown", "vertex/gpt-image-2", `vertex/${videoModel}`, ...qualifiedRetiredIds]) {
+    const unavailable = mediaControls(id);
+    assert.deepEqual(unavailable.size, []);
+    assert.deepEqual(unavailable.resolution, []);
+    assert.deepEqual(unavailable.aspect_ratio, []);
+    assert.equal(unavailable.size_limits, undefined);
+  }
+});
+
+test("image and video output controls reach only the selected backend's wire fields", {
+  timeout: 30000,
+}, async (t) => {
+  const requests: { path: string | undefined; body: unknown }[] = [];
+  const config = parseConfig({
+    baseUrl: `${await server(t, (req, res) => {
+      if (req.method === "GET") {
+        res.end(
+          JSON.stringify({ data: [...openaiIds, ...ids, ...qualifiedGoogleIds].map((id) => ({ id })) }),
+        );
+        return;
+      }
+      void body(req).then((value) => {
+        requests.push({ path: req.url, body: value });
+        res.end(
+          JSON.stringify(
+            req.url === "/gateway/v1/videos"
+              ? { request_id: "fixture" }
+              : req.url?.includes("generateContent")
+                ? googleResponse()
+                : { data: [{ b64_json: png }] },
+          ),
+        );
+      });
+    })}/gateway`,
+  });
+  const ctx = { ...context(await home(t)), sessionManager: SessionManager.inMemory() };
+  const chat = ctx.model;
+  for (const model of openaiIds) {
+    const sizes =
+      model === "gpt-image-1.5"
+        ? ["auto", "1024x1536"]
+        : ["auto", "1024x640", "1536x512", "1536x864", "2048x2048", "3840x2160", "2160x3840"];
+    for (const size of sizes) {
+      const image = await generateImage(config, { model, prompt: "fixture", size }, ctx);
+      assert.equal(image.details.model, model);
+      assert.deepEqual(requests.at(-1), {
+        path: "/gateway/v1/images/generations",
+        body: { model, prompt: "fixture", n: 1, size },
+      });
+      assert.equal((await readFile(image.details.files[0].path)).toString("base64"), png);
+    }
+  }
+  for (const model of ids.slice(0, 3)) {
+    await generateImage(config, { model, prompt: "fixture", resolution: "2k", aspect_ratio: "20:9" }, ctx);
+    assert.deepEqual(requests.at(-1), {
+      path: "/gateway/v1/images/generations",
+      body: {
+        model,
+        prompt: "fixture",
+        n: 1,
+        response_format: "b64_json",
+        resolution: "2k",
+        aspect_ratio: "20:9",
+      },
+    });
+  }
+  for (const model of qualifiedGoogleIds) {
+    const resolutions = mediaControls(model).resolution;
+    for (const resolution of resolutions.length ? resolutions : [undefined]) {
+      const aspect_ratio = model.endsWith("gemini-3.1-flash-image") ? "8:1" : "9:16";
+      const image = await generateImage(config, { model, prompt: "fixture", resolution, aspect_ratio }, ctx);
+      assert.equal(image.details.model, model);
+      assert.deepEqual(requests.at(-1), {
+        path: `/gateway/v1beta/models/${model}:generateContent`,
+        body: {
+          contents: [{ role: "user", parts: [{ text: "fixture" }] }],
+          generationConfig: {
+            responseModalities: ["TEXT", "IMAGE"],
+            candidateCount: 1,
+            imageConfig: { aspectRatio: aspect_ratio, ...(resolution ? { imageSize: resolution } : {}) },
+          },
+        },
+      });
+    }
+  }
+  for (const model of ids.slice(3)) {
+    for (const resolution of mediaControls(model).resolution) {
+      const video = await generateVideo(
+        config,
+        { model, prompt: "fixture", duration: 1, resolution, aspect_ratio: "9:16" },
+        ctx,
+      );
+      assert.equal(video.model, model);
+      assert.deepEqual(requests.at(-1), {
+        path: "/gateway/v1/videos",
+        body: { model, prompt: "fixture", duration: 1, resolution, aspect_ratio: "9:16" },
+      });
+    }
+  }
+  assert.equal(ctx.model, chat);
+  assert.deepEqual(ctx.sessionManager.getBranch(), []);
+});
+
+test("unsupported output controls fail before auth, discovery, generation, or file writes", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("Invalid controls must not access the network"));
+  const config = parseConfig({});
+  const ctx = {
+    ...context(await home(t)),
+    modelRegistry: { getProviderAuth: async () => assert.fail("Invalid controls must fail before auth") },
+  };
+  for (const size of [
+    "",
+    "16x16",
+    "0x1024",
+    "-1024x1024",
+    "1025x1024",
+    "3856x1792",
+    "3072x3072",
+    "3072x768",
+    "1024x624",
+    "1024X1024",
+    "1024x1024\n",
+    " 1024x1024",
+    "1024x1024 ",
+    "1e3x1024",
+    "999999999x1024",
+  ]) {
+    await assert.rejects(
+      generateImage(config, { model: "gpt-image-2", prompt: "fixture", size }, ctx),
+      /CLIProxyAPI size/,
+    );
+  }
+  for (const params of [
+    { model: "gpt-image-1.5", size: "2048x2048" },
+    { model: "gpt-image-2", resolution: "2K" },
+    { model: "gpt-image-2.5-sunburst", size: "1024x1024", aspect_ratio: "1:1" },
+    { model: "gemini-2.5-flash-image", resolution: "1K" },
+    { model: "gemini-3-pro-image", resolution: "512" },
+    { model: "gemini-3-pro-image", size: "1024x1024" },
+    { model: "gemini-3.1-flash-lite-image", resolution: "2K" },
+    { model: "gemini-3.1-flash-lite-image", aspect_ratio: "8:1" },
+    { model: "gemini-3.1-flash-image", resolution: "2k" },
+    { model: imageModel, resolution: "4k" },
+    { model: imageModel, size: "1024x1024" },
+    { model: imageModel, aspect_ratio: "21:9" },
+    { model: imageModel, aspect_ratio: "auto" },
+  ])
+    await assert.rejects(
+      generateImage(config, { prompt: "fixture", ...params }, ctx),
+      /CLIProxyAPI .*unsupported/,
+    );
+  for (const params of [
+    { model: "grok-imagine-video", resolution: "1080p" },
+    { model: videoModel, resolution: "4K" },
+    { model: videoModel, aspect_ratio: "21:9" },
+    { model: videoModel, size: "1280x720" },
+  ])
+    await assert.rejects(
+      generateVideo(config, { prompt: "fixture", ...params }, ctx),
+      /CLIProxyAPI .*unsupported/,
+    );
+  for (const field of ["size", "resolution", "aspect_ratio"]) {
+    for (const value of [null, 123, {}, [], "", "\n"]) {
+      await assert.rejects(
+        generateImage(config, { model: "gpt-image-2", prompt: "fixture", [field]: value }, ctx),
+        /CLIProxyAPI .*unsupported/,
+      );
+    }
+  }
+  assert.deepEqual(await readdir(ctx.cwd), []);
 });
 
 test("OpenAI caller cancellation and overall timeout destroy an incoming body after partial data", {

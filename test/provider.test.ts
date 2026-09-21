@@ -19,6 +19,7 @@ import {
   InMemoryCredentialStore,
   InMemoryModelsStore,
   type Model,
+  normalizeContext,
   Type,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
@@ -46,7 +47,12 @@ const known: Model<Api>[] = [
   contextWindow: 128000,
   maxTokens: 8192,
   cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 },
-  compat: { forceAdaptiveThinking: true },
+  compat: {
+    forceAdaptiveThinking: true,
+    supportsMidConvoSystemMessages: true,
+    supportsMidConvoToolChanges: true,
+    supportsMidConvoToolAdditions: true,
+  },
 }));
 const catalog = { data: known.map(({ id, provider }) => ({ id, owned_by: provider })) };
 const noEnvironment = { env: async () => undefined, fileExists: async () => false };
@@ -146,6 +152,12 @@ test("mapping keeps native metadata and routes every supported family to the pro
   assert.ok(hasApi(claude, "anthropic-messages"));
   assert.equal(claude.compat?.forceAdaptiveThinking, true);
   assert.equal(claude.compat?.supportsEagerToolInputStreaming, false);
+  assert.equal(claude.compat?.supportsMidConvoToolChanges, false);
+  for (const model of result.models) {
+    if (hasApi(model, "google-generative-ai")) continue;
+    assert.equal(model.compat?.supportsMidConvoSystemMessages, false);
+    if (hasApi(model, "openai-completions")) assert.equal(model.compat?.supportsMidConvoToolAdditions, false);
+  }
 });
 
 test("aliases keep wire IDs, hidden entries disappear, and unknowns are not guessed", () => {
@@ -289,6 +301,27 @@ test("old-policy chat catalogs cannot restore qualified retired media aliases", 
         .update(JSON.stringify([1, config]))
         .digest("hex"),
       models: [{ ...known[3], id, provider: PROVIDER_ID, headers: undefined }],
+    },
+    async publish(publication) {
+      publication.update?.();
+      return true;
+    },
+  });
+  assert.deepEqual(provider.getModels(), []);
+});
+
+test("previous Pi compatibility catalogs cannot restore unverified transcript capabilities", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("Offline restoration must not contact the proxy"));
+  const config = parseConfig({});
+  const provider = createCliproxyProvider(config, known);
+  await provider.refreshModels({
+    allowNetwork: false,
+    signal: AbortSignal.timeout(5000),
+    stored: {
+      etag: createHash("sha256")
+        .update(JSON.stringify([3, config]))
+        .digest("hex"),
+      models: [{ ...known[0], provider: PROVIDER_ID, headers: undefined }],
     },
     async publish(publication) {
       publication.update?.();
@@ -525,7 +558,19 @@ test("native adapters stream each family and qualified route through the right e
       const result = await models.completeSimple(
         { ...model, baseUrl: "https://must-not-contact.example" },
         {
-          messages: [{ role: "user", content: "Return ok.", timestamp: 0 }],
+          systemPrompt: "fixture-system",
+          messages: [
+            { role: "user", content: "fixture", timestamp: 0 },
+            {
+              role: "system",
+              content: "fixture-update",
+              toolsAdded: [
+                { name: "late_fixture_tool", description: "Fixture tool", parameters: Type.Object({}) },
+              ],
+              timestamp: 0,
+            },
+            { role: "user", content: "Return ok.", timestamp: 0 },
+          ],
           tools: [
             {
               name: "fixture_tool",
@@ -563,6 +608,8 @@ test("native adapters stream each family and qualified route through the right e
       assert.equal(requestUrl.pathname, expected);
       if (actualApi === "google-generative-ai") assert.equal(requestUrl.searchParams.get("alt"), "sse");
       assert.ok(isRecord(seenBody));
+      for (const marker of ["fixture-system", "fixture-update", "late_fixture_tool"])
+        assert.ok(JSON.stringify(seenBody).includes(marker), marker);
       if (actualApi !== "google-generative-ai") assert.equal(seenBody.model, source.id);
       if (actualApi === "anthropic-messages") {
         assert.ok(isRecord(seenBody.thinking));
@@ -877,6 +924,7 @@ test("qualified Gemini adapters retain thinking, tool IDs, strict sampling, imag
   for (const source of sources) {
     const signature = "c2lnbmF0dXJl";
     const history = (id: string): Context => ({
+      systemPrompt: "fixture-system",
       messages: [
         { role: "user", content: "fixture", timestamp: 0 },
         {
@@ -922,7 +970,7 @@ test("qualified Gemini adapters retain thinking, tool IDs, strict sampling, imag
       const model = mapCatalog({ data: [{ id }] }, parseConfig({ baseUrl }), sources).models[0];
       assert.ok(model);
       const before = structuredClone(context);
-      const stream = provider.streamSimple(model, context, {
+      const stream = provider.streamSimple(model, normalizeContext(context), {
         apiKey: key,
         headers: { Authorization: `Bearer ${key}` },
         reasoning: "high",
@@ -932,6 +980,8 @@ test("qualified Gemini adapters retain thinking, tool IDs, strict sampling, imag
           assert.equal(hookModel.id, id);
           assert.ok(isRecord(payload));
           assert.equal(payload.model, id);
+          assert.ok(isRecord(payload.config));
+          assert.equal(payload.config.systemInstruction, "fixture-system");
           inspect(payload);
           return { ...payload, config: { ...(payload.config as object), temperature: 0.25 } };
         },

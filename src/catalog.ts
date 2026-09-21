@@ -185,7 +185,8 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
               ...reference.compat,
               supportsEagerToolInputStreaming: false,
               supportsStrictTools: false,
-              supportsToolReferences: false,
+              supportsMidConvoSystemMessages: false,
+              supportsMidConvoToolChanges: false,
               supportsMidConvoEffort: false,
               allowedFallbackModels: undefined,
             }
@@ -194,6 +195,8 @@ export function mapCatalog(value: unknown, config: Config, known: readonly Model
             : {
                 ...reference.compat,
                 supportsStrictMode: false,
+                supportsMidConvoSystemMessages: false,
+                supportsMidConvoToolAdditions: false,
                 supportsOpenAIGrammarTools: false,
                 supportsToolSearch: false,
                 supportsAdditionalTools: false,

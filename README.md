@@ -9,10 +9,10 @@ Chat uses Pi's native API adapters and model metadata, with availability from yo
 You need Pi 0.87.x and Node.js 22.19 or newer. Run CLIProxyAPI with your upstream accounts configured before connecting Pi. This release targets CLIProxyAPI 7.3.11. The extension adds no runtime dependencies and needs no compilation.
 
 ```sh
-pi install npm:pi-cliproxy-native
+pi install git:github.com/hawkff/pi-cliproxy-native@v0.1.0
 ```
 
-You can also install from `git:github.com/hawkff/pi-cliproxy-native` or a local checkout with `pi install /path/to/pi-cliproxy-native`.
+For a local checkout, use `pi install /path/to/pi-cliproxy-native`.
 
 The default proxy address is `http://localhost:8317`. For another address, set the [connection](#connection) before logging in. Restart Pi, then run:
 
